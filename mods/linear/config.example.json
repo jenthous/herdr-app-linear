@@ -1,0 +1,7 @@
+{
+  "language": "en",
+  "agent": ["claude"],
+  "agentName": "Claude",
+  "refreshSeconds": 60,
+  "demo": false
+}

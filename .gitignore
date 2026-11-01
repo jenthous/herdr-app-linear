@@ -1,0 +1,5 @@
+mods/linear/.cache/
+mods/linear/config.json
+mods/linear/gpui-kit.d.ts
+mods/linear/jsconfig.json
+.DS_Store
