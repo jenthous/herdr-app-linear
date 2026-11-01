@@ -23,6 +23,7 @@ const PEOPLE = {
 };
 const L = {
   bug: { id: "l1", name: "Bug", color: "#eb5757" },
+  repo: { id: "l9", name: "acme/web", color: "#4cb782" },
   feature: { id: "l2", name: "Feature", color: "#bb87fc" },
   perf: { id: "l3", name: "Performance", color: "#4ea7fc" },
   ux: { id: "l4", name: "UX", color: "#f2994a" },
@@ -66,7 +67,7 @@ const cycle = { id: "c1", number: 24, name: null };
 const parent = { id: "demo-p", identifier: "ENG-120", title: "Checkout reliability", state: S.progress };
 
 const mine = [
-  issue("ENG", 142, "Cart is cleared when the session token refreshes during payment", "progress", 1, PEOPLE.me, ["bug"], 12, { description: checkoutBody, project, cycle, parent, pr: 1873 }),
+  issue("ENG", 142, "Cart is cleared when the session token refreshes during payment", "progress", 1, PEOPLE.me, ["bug", "repo"], 12, { description: checkoutBody, project, cycle, parent, pr: 1873 }),
   issue("ENG", 139, "Retry failed webhook deliveries with exponential backoff", "review", 2, PEOPLE.me, ["feature"], 48, { project, pr: 1866 }),
   issue("DES", 51, "Empty states for the orders page", "progress", 3, PEOPLE.me, ["ux"], 95),
   issue("ENG", 133, "Search results flicker while typing", "todo", 2, PEOPLE.me, ["bug", "ux"], 180),
@@ -91,7 +92,18 @@ const rel = (id) => ({ id: byId[id].id, identifier: id, title: byId[id].title, s
 
 const comment = (id, who, mins, body) => ({ id, body, createdAt: at(mins), editedAt: null, user: who });
 
+// Where the agent picker offers to work (fake spaces; nothing starts in demo mode).
+const sp = (name, machine) => ({ id: `s-${name}`, name, machine });
+const places = [
+  { kind: "tab", rank: 3, space: sp("web", null), folder: "~/.herdr/worktrees/web/sam-eng-142-cart-token", repo: "acme/web", branch: "sam/eng-142-cart-token" },
+  { kind: "tab", rank: 2, space: sp("web", null), folder: "~/code/acme/web", repo: "acme/web", branch: "main" },
+  { kind: "tab", rank: 2, space: sp("gpu-box", "build-1"), folder: "~/src/web", repo: "acme/web", branch: "main" },
+  { kind: "worktree", rank: 1, machine: null, folder: "~/code/acme/web", repo: "acme/web", branch: "sam/eng-142-cart-token" },
+  { kind: "tab", rank: 0, space: sp("notes", null), folder: "~/notes", repo: null, branch: null },
+];
+
 export const demo = {
+  places,
   viewer: {
     id: PEOPLE.me.id, name: PEOPLE.me.name, displayName: PEOPLE.me.displayName,
     organization: { id: "o1", name: "Acme", urlKey: "acme" },

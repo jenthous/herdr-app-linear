@@ -13,7 +13,7 @@ A native port of [herdr-linear](https://github.com/jenthous/herdr-linear), the t
 - **Linear's look.** State icons (backlog, todo, in progress, in review, done, canceled) in each state's color, and priority bars with the urgent mark.
 - **Preview and detail.** Description with images, comments, the open pull request, and parent, sub-issues, blocked by, blocking and related issues. Click a relation to follow it; Esc comes back.
 - **Images.** Images in descriptions and comments are downloaded once (Linear uploads with your key) and fitted to the window. Click one to open it full size.
-- **Agents.** `c` opens a new tab named after the issue running your agent (Claude Code by default) with the issue as its first message. Any tab whose name contains an identifier is linked: the issue shows a spinner and the elapsed time while the agent works, "needs you" when it's blocked, and `g` takes you there.
+- **Agents.** `c` asks where to work, then opens a tab named after the issue running your agent (Claude Code by default) with the issue as its first message. The choices cover every space on every machine: a checkout already on the issue (its branch, or its or its parent's identifier in the path), the issue's repo found by an `owner/repo` label (e.g. from the GitHub integration) against each checkout's `origin`, and a new git worktree on the issue's branch. Any tab whose name contains an identifier is linked: the issue shows a spinner and the elapsed time while the agent works, "needs you" when it's blocked, and `g` takes you there.
 - **Current branch.** The issue of the focused pane's branch (`me/eng-142-…`) is pinned on top of My issues.
 - **Fast reopen.** Everything fetched is cached, so the window shows your lists instantly and refreshes in the background every 60 s.
 
@@ -44,7 +44,7 @@ If none is found, the window asks for it and saves it to the last path with mode
 | List | type to search, ↑/↓ or ⌃N/⌃P move, Enter open, Tab/⇧Tab switch list, ⌃O browser, ⌃Y copy URL, ⌃R refresh, Esc clear search or close |
 | Detail | Esc back, Tab description/comments, `c` agent tab, `g` go to the agent's tab, `o` browser, `y` copy URL, `Y` copy PR link, `i` copy ID, `r` refresh, `q` close |
 
-Commands for `keys.json` or `herdr-app do`: `linear.search`, `linear.refresh`, `linear.open:ENG-123`, `linear.comments` (switch description/comments), `linear.demo` (toggles demo data, no key needed).
+Commands for `keys.json` or `herdr-app do`: `linear.search`, `linear.refresh`, `linear.open:ENG-123`, `linear.comments` (switch description/comments), `linear.work` (the agent picker for the shown issue), `linear.demo` (toggles demo data, no key needed).
 
 ## Settings
 
@@ -67,7 +67,7 @@ Optional `mods/linear/config.json` (see `config.example.json`):
 ## What it touches
 
 - **Network:** `api.linear.app` (GraphQL) and the image hosts linked in issues.
-- **Programs:** `curl`, `file` and `sips` (image size, macOS) for images, `open` to show an image full size, `sh` for file permissions.
+- **Programs:** `git` and `sh` in each space's folder, on that space's machine, to find repos (three levels deep) and add worktrees under `~/.herdr/worktrees/`; `curl`, `file` and `sips` (image size, macOS) for images, `open` to show an image full size, `sh` for file permissions.
 - **Files:** reads the credential files above; writes its cache to `mods/linear/.cache/` (mode 0700).
 
 ## License

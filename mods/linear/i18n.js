@@ -53,6 +53,16 @@ const en = {
   },
   ago: { now: "just now", m: (n) => `${n}m ago`, h: (n) => `${n}h ago`, d: (n) => `${n}d ago` },
   task: (issue) => `Work on Linear ${issue.identifier}: ${issue.title}\n${issue.url}`,
+  pickTitle: (agent, id) => `Where should ${agent} work on ${id}?`,
+  pickHint: "↑↓ choose · Enter or 1–9 start · Esc cancel · repos are matched by \"owner/repo\" labels",
+  scanning: "looking for repos…",
+  thisComputer: "this computer",
+  recommended: "issue's repo",
+  onBranch: "on the issue branch",
+  newWorktree: "New worktree",
+  space: "space",
+  starting: "Starting…",
+  pickFailed: "Couldn't start",
 };
 
 const ko = {
@@ -108,6 +118,16 @@ const ko = {
   },
   ago: { now: "방금", m: (n) => `${n}분 전`, h: (n) => `${n}시간 전`, d: (n) => `${n}일 전` },
   task: (issue) => `Linear ${issue.identifier} 작업: ${issue.title}\n${issue.url}`,
+  pickTitle: (agent, id) => `${id}, ${agent}가 어디서 작업할까요?`,
+  pickHint: "↑↓ 선택 · Enter 또는 1–9 시작 · Esc 취소 · 레포는 \"owner/repo\" 라벨로 찾아요",
+  scanning: "레포 찾는 중…",
+  thisComputer: "이 컴퓨터",
+  recommended: "이슈 레포",
+  onBranch: "이슈 브랜치",
+  newWorktree: "새 워크트리",
+  space: "스페이스",
+  starting: "시작하는 중…",
+  pickFailed: "시작하지 못했어요",
 };
 
 const LANGS = { en, ko };

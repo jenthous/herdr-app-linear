@@ -14,6 +14,7 @@ import { Images, splitMarkdown, imageUrls } from "./media.js";
 import { Store } from "./store.js";
 import { T, setLanguage } from "./i18n.js";
 import { demo } from "./demo.js";
+import { Places } from "./places.js";
 
 const BASE = "mods/linear";
 const ICON = `${BASE}/icons`;
@@ -84,6 +85,8 @@ export default class Linear extends View {
     this.mode = "list"; // list | detail
     this.stack = []; // issues followed through relations in the detail view
     this.section = "body"; // body | comments
+    this.places = new Places();
+    this.pick = null; // { issue, sel }: choosing where the agent works
     this.status = null; // { text, level }
     this.flash = null;
     this.loading = new Set();
@@ -120,7 +123,12 @@ export default class Linear extends View {
       this.key = await api.loadKey() ?? load("key", null);
       if (!this.key) { this.needKey = true; cx.notify(); this.keyInput.focus(); return; }
       this.input.focus();
+      // The shown issue's comments first: requests queue in the runtime, and the lists are big.
+      const shown = this.shownId();
+      if (shown) await this.loadDetail(cx, shown);
       await this.refresh(cx, true);
+      await this.prefetchDetails(cx);
+      await this.places.scanAll();
     });
     cx.timer.every(2000, () => { STORE.flush(); });
     cx.timer.every(Math.max(10, this.config.refreshSeconds) * 1000, (cx) => { if (this.key && !DEMO) this.refresh(cx, false); });
@@ -146,6 +154,7 @@ export default class Linear extends View {
         else if (name === "demo") this.setDemo(!DEMO, cx);
         else if (name === "open" && arg) this.openDetail(arg.toUpperCase(), cx, true);
         else if (name === "comments") this.section = this.section === "comments" ? "body" : "comments";
+        else if (name === "work") { const id = this.shownId(); const i = id && (this.details[id]?.issue ?? this.cache[id]); if (i) this.work(i, cx); }
         cx.notify();
       }
     });
@@ -241,7 +250,7 @@ export default class Linear extends View {
       save("all", this.all.slice(0, api.PAGE_SIZE).map(slim)); this.remember(page.nodes);
     }
     const shown = this.shownId();
-    if (shown && this.details[shown]) this.loadDetail(cx, shown, true);
+    if (shown) this.loadDetail(cx, shown, true);
     if (this.query) this.searchServer(cx, this.query);
     cx.notify();
   }
@@ -270,6 +279,15 @@ export default class Linear extends View {
     const keep = new Set([...this.recent.slice(0, 20), ...this.mine.slice(0, 10).map((i) => i.identifier), id]);
     save("details", Object.fromEntries(Object.entries(this.details).filter(([k]) => keep.has(k)).slice(-30)));
     this.prefetchImages(cx, d);
+  }
+
+  // Details (comments, relations) of the top rows, one at a time, so moving through the list is instant.
+  async prefetchDetails(cx) {
+    const ids = this.pickable().filter((r) => r.kind === "issue").slice(0, 8).map((r) => r.issue.identifier);
+    for (const id of ids) {
+      if (DEMO || !this.key) return;
+      await this.loadDetail(cx, id);
+    }
   }
 
   prefetchImages(cx, d) {
@@ -477,11 +495,48 @@ export default class Linear extends View {
   copy(text, what, cx) { cx.write_to_clipboard(text); this.say(T().copied(what, text), cx, "success"); }
   openUrl(url, cx) { if (/^https?:/.test(url)) cx.open_url(url); }
 
-  // A new tab named after the issue, running the agent with the issue as its first message.
-  work(issue) {
-    if (DEMO) return;
-    run("tab.new", { name: issue.identifier, argv: this.config.agent, task: T().task(issue) });
-    this.dismiss();
+  // Asks where to work, then opens a tab (or a worktree space) named after the issue, running
+  // the agent with the issue as its first message.
+  work(issue, cx) {
+    this.pick = { issue, sel: 0 };
+    if (!DEMO) cx.spawn(async (cx) => { await this.places.scanAll(); cx.notify(); });
+    cx.notify();
+  }
+
+  choices() {
+    if (!this.pick) return [];
+    return DEMO ? demo.places : this.places.choices(this.pick.issue);
+  }
+
+  startChoice(c, cx) {
+    const issue = this.pick?.issue;
+    if (!c || !issue) return;
+    if (DEMO) { this.pick = null; cx.notify(); return; }
+    this.say(T().starting, cx);
+    cx.spawn(async (cx) => {
+      try {
+        await this.places.start(c, { name: issue.identifier, argv: this.config.agent, task: T().task(issue) });
+        this.pick = null;
+        this.dismiss();
+      } catch (e) {
+        this.status = { text: `${T().pickFailed}: ${e?.message ?? e}`, level: "error" };
+        cx.notify();
+      }
+    });
+  }
+
+  pickKey(k, cx) {
+    const list = this.choices();
+    const n = list.length;
+    const mv = (d) => { if (n) this.pick.sel = Math.max(0, Math.min(n - 1, this.pick.sel + d)); };
+    const m = {
+      down: () => mv(1), up: () => mv(-1), "ctrl-n": () => mv(1), "ctrl-p": () => mv(-1), tab: () => mv(1), "shift-tab": () => mv(-1),
+      enter: () => this.startChoice(list[this.pick.sel], cx),
+      escape: () => { this.pick = null; }, q: () => { this.pick = null; },
+    };
+    if (/^[1-9]$/.test(k) && Number(k) <= n) m[k] = () => this.startChoice(list[Number(k) - 1], cx);
+    if (!m[k]) return false;
+    m[k](); cx.notify(); return true;
   }
 
   onKey(e, cx) {
@@ -489,12 +544,13 @@ export default class Linear extends View {
     const id = this.shownId();
     const issue = id ? (this.details[id]?.issue ?? this.cache[id]) : null;
     if (this.needKey) { if (k === "escape") this.dismiss(); return; }
+    if (this.pick) { if (this.pickKey(k, cx)) cx.stop_propagation(); return; }
     if (this.mode === "detail") {
       const m = {
         escape: () => this.back(cx), backspace: () => this.back(cx), q: () => this.dismiss(),
         o: () => issue && this.openUrl(issue.url, cx), y: () => issue && this.copy(issue.url, "URL", cx),
         "shift-y": () => { const pr = api.openPr(issue); pr ? this.copy(pr.url, T().prLink, cx) : this.say(T().noPr, cx); },
-        i: () => issue && this.copy(issue.identifier, "ID", cx), c: () => issue && this.work(issue),
+        i: () => issue && this.copy(issue.identifier, "ID", cx), c: () => issue && this.work(issue, cx),
         r: () => id && this.loadDetail(cx, id, true),
         g: () => { const l = id && this.tabLinks()[id]; l ? this.goTab(l) : this.say(T().noTab, cx); },
         tab: () => { this.section = this.section === "body" ? "comments" : "body"; cx.notify(); },
@@ -529,6 +585,7 @@ export default class Linear extends View {
     if (this.needKey) return root.child(this.keyScreen(t));
     this.links = this.tabLinks();
     const wide = this.width >= WIDE;
+    if (this.pick) return root.child(this.header(t)).child(this.pickView(t)).child(this.footer(t));
     const body = this.mode === "detail"
       ? this.detailView(t, this.stack[this.stack.length - 1], true)
       : wide
@@ -728,7 +785,7 @@ export default class Linear extends View {
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(tr.tabIn(link.space.name, link.tab.name)))
         .child(this.button(t, "d-go", tr.goTab, () => this.goTab(link), true))))
       .child(h_flex().gap(6).flex_wrap()
-        .child(this.button(t, "d-work", link ? tr.newAgentTab(agent) : tr.workWith(agent), () => this.work(issue), !link))
+        .child(this.button(t, "d-work", link ? tr.newAgentTab(agent) : tr.workWith(agent), (cx) => this.work(issue, cx), !link))
         .child(this.button(t, "d-open", tr.browser, (cx) => this.openUrl(issue.url, cx)))
         .child(this.button(t, "d-url", tr.copyUrl, (cx) => this.copy(issue.url, "URL", cx)))
         .child(this.button(t, "d-id", tr.copyId, (cx) => this.copy(issue.identifier, "ID", cx)))
@@ -773,6 +830,42 @@ export default class Linear extends View {
     return h_flex().h(26).flex_none().px(12).gap(10).items_center().border_t(1).border_color(t.border).text_size(11)
       .child(div().flex_1().min_w(0).truncate().text_color(s ? (s.level === "error" ? t.blocked : s.level === "success" ? t.done : t.muted) : t.dim).child(s?.text ?? hint))
       .child(div().flex_none().text_color(t.dim).child(this.viewer ? `${this.viewer.displayName ?? this.viewer.name} · ${T().teams} ${(this.viewer.teams?.nodes ?? []).map((x) => x.key).join(" ")}` : ""));
+  }
+
+  pickView(t) {
+    const tr = T(), issue = this.pick.issue, list = this.choices();
+    const sel = Math.min(this.pick.sel, Math.max(0, list.length - 1));
+    const tilde = (p) => (p || "~").replace(home(), "~").replace(/^\/(Users|home)\/[^/]+/, "~");
+    const machine = (m) => div().flex_none().text_size(10.5).px(6).py(1).rounded(4).border_1().border_color(t.border)
+      .text_color(m ? t.accent : t.dim).child(m ?? tr.thisComputer);
+    const rows = list.map((c, n) => {
+      const on = n === sel;
+      const wt = c.kind === "worktree";
+      const main = wt
+        ? h_flex().flex_1().min_w(0).gap(8).items_center()
+          .child(div().flex_none().font_semibold().child(tr.newWorktree))
+          .child(div().min_w(0).truncate().text_color(t.muted).child(`${c.branch}  ←  ${tilde(c.folder)}`))
+        : h_flex().flex_1().min_w(0).gap(8).items_center()
+          .child(div().flex_none().font_semibold().child(c.space.name || tr.space))
+          .child(div().min_w(0).truncate().text_color(t.muted).child(tilde(c.folder)))
+          .when(Boolean(c.branch), (el) => el.child(div().flex_none().text_size(11).text_color(c.rank === 3 ? t.done : t.dim).child(c.branch)));
+      return h_flex().id(`pk-${n}`).h(40).px(12).gap(10).items_center().rounded(8).cursor_pointer()
+        .bg(on ? t.selected : t.popover).hover((s) => s.bg(on ? t.selected : t.hover))
+        .on_mouse_down("left", stop)
+        .on_click((_e, cx) => { if (on) this.startChoice(c, cx); else { this.pick.sel = n; cx.notify(); } })
+        .child(div().w(14).flex_none().text_size(11).text_color(t.dim).child(n < 9 ? String(n + 1) : ""))
+        .child(machine(wt ? c.machine : c.space.machine))
+        .child(main)
+        .when(c.rank >= 2, (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child(c.rank === 3 ? tr.onBranch : tr.recommended)));
+    });
+    const busy = !DEMO && this.places.scanning();
+    return v_flex().flex_1().min_h(0).w_full().p(16).gap(10)
+      .child(h_flex().gap(8).items_center()
+        .child(div().text_size(15).font_semibold().child(tr.pickTitle(this.config.agentName ?? "Claude", issue.identifier)))
+        .when(busy, (el) => el.child(svg(`${ICON}/spinner.svg`).size(13).text_color(t.dim).spin(900)).child(div().text_size(11.5).text_color(t.dim).child(tr.scanning))))
+      .child(div().text_size(12).text_color(t.muted).truncate().child(issue.title))
+      .child(v_flex().id("pk-list").flex_1().min_h(0).gap(2).overflow_y_scrollbar().children(rows))
+      .child(div().text_size(11.5).text_color(t.dim).child(tr.pickHint));
   }
 
   keyScreen(t) {
