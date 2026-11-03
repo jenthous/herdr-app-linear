@@ -3,5 +3,9 @@
   "agent": ["claude"],
   "agentName": "Claude",
   "refreshSeconds": 60,
-  "demo": false
+  "demo": false,
+  "autoState": true,
+  "taskContext": true,
+  "terminalIssues": true,
+  "nestSubIssues": true
 }

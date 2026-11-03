@@ -43,7 +43,9 @@ function issue(team, number, title, state, priority, who, labels, mins, extra = 
     createdAt: at(mins + 4000), updatedAt: at(mins), archivedAt: null, trashed: false,
     team: TEAMS[team], state: S[state], assignee: who ?? null, project: extra.project ?? null, cycle: extra.cycle ?? null,
     parent: extra.parent ?? null, labels: { nodes: labels.map((l) => L[l]) },
-    attachments: { nodes: extra.pr ? [{ url: `https://github.com/acme/web/pull/${extra.pr}`, sourceType: "github", createdAt: at(mins), metadata: { status: "open", number: extra.pr, draft: false } }] : [] },
+    attachments: { nodes: extra.pr ? [{ url: `https://github.com/acme/web/pull/${extra.pr}`, sourceType: "github", createdAt: at(mins),
+      metadata: { status: extra.prStatus ?? "open", number: extra.pr, draft: Boolean(extra.prDraft), repoName: "web", hasConflicts: Boolean(extra.prConflicts),
+        reviews: extra.prReview ? [{ state: extra.prReview, reviewerLogin: "ana", submittedAt: at(mins) }] : [] } }] : [] },
   };
 }
 
@@ -68,8 +70,8 @@ const parent = { id: "demo-p", identifier: "ENG-120", title: "Checkout reliabili
 
 const mine = [
   issue("ENG", 142, "Cart is cleared when the session token refreshes during payment", "progress", 1, PEOPLE.me, ["bug", "repo"], 12, { description: checkoutBody, project, cycle, parent, pr: 1873 }),
-  issue("ENG", 139, "Retry failed webhook deliveries with exponential backoff", "review", 2, PEOPLE.me, ["feature"], 48, { project, pr: 1866 }),
-  issue("DES", 51, "Empty states for the orders page", "progress", 3, PEOPLE.me, ["ux"], 95),
+  issue("ENG", 139, "Retry failed webhook deliveries with exponential backoff", "review", 2, PEOPLE.me, ["feature"], 48, { project, pr: 1866, prReview: "approved" }),
+  issue("DES", 51, "Empty states for the orders page", "progress", 3, PEOPLE.me, ["ux"], 95, { pr: 1880, prDraft: true }),
   issue("ENG", 133, "Search results flicker while typing", "todo", 2, PEOPLE.me, ["bug", "ux"], 180),
   issue("ENG", 128, "Cache product images at the edge", "todo", 3, PEOPLE.me, ["perf"], 320, { cycle }),
   issue("OPS", 27, "Rotate the staging database credentials", "todo", 2, PEOPLE.me, [], 600, { dueDate: "2026-11-07" }),
@@ -80,9 +82,9 @@ const mine = [
 const others = [
   issue("ENG", 145, "Rate-limit the password reset form", "todo", 1, PEOPLE.leo, ["bug"], 30),
   issue("DES", 53, "New illustration set for onboarding", "progress", 3, PEOPLE.mia, ["ux"], 70),
-  issue("ENG", 143, "Show delivery estimates on the product page", "review", 2, PEOPLE.ana, ["feature"], 140, { project }),
+  issue("ENG", 143, "Show delivery estimates on the product page", "review", 2, PEOPLE.ana, ["feature"], 140, { project, pr: 1861, prReview: "changes_requested", prConflicts: true }),
   issue("OPS", 29, "Alert when the payment queue backs up", "progress", 2, PEOPLE.leo, ["perf"], 210),
-  issue("ENG", 141, "Remove unused feature flags", "done", 4, PEOPLE.ana, [], 400),
+  issue("ENG", 141, "Remove unused feature flags", "done", 4, PEOPLE.ana, [], 400, { pr: 1850, prStatus: "merged" }),
   issue("DES", 50, "Audit color contrast in forms", "done", 3, PEOPLE.mia, ["ux"], 900),
   issue("ENG", 140, "Support Apple Pay in checkout", "canceled", 3, null, ["feature"], 1300),
 ];

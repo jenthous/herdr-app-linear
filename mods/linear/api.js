@@ -157,21 +157,76 @@ export async function issueDetail(key, id) {
   return { issue, comments, moreComments: i.comments?.pageInfo?.hasNextPage ?? false, relations, at: Date.now() };
 }
 
-// The linked open pull request; the most recently linked when there are several.
-export function openPr(issue) {
-  const prNumber = (url) => {
-    for (const m of ["/pull/", "/merge_requests/"]) {
-      const rest = url.split(m)[1];
-      if (rest) { const n = parseInt(rest.split(/[/?#]/)[0], 10); if (!isNaN(n)) return n; }
-    }
-    return null;
-  };
-  const open = (issue?.attachments?.nodes ?? [])
+function prNumber(url) {
+  for (const m of ["/pull/", "/merge_requests/"]) {
+    const rest = String(url ?? "").split(m)[1];
+    if (rest) { const n = parseInt(rest.split(/[/?#]/)[0], 10); if (!isNaN(n)) return n; }
+  }
+  return null;
+}
+
+// The overall review: changes requested beats approved, using each reviewer's latest decision.
+function reviewState(reviews) {
+  const last = new Map();
+  for (const r of [...(reviews ?? [])].sort((a, b) => String(a.submittedAt ?? "").localeCompare(String(b.submittedAt ?? "")))) {
+    const st = String(r.state ?? "").toLowerCase();
+    const who = r.reviewerId ?? r.reviewerLogin ?? "?";
+    if (st === "approved" || st === "changes_requested") last.set(who, st);
+    else if (st === "dismissed") last.delete(who);
+  }
+  const all = [...last.values()];
+  return all.includes("changes_requested") ? "changes" : all.includes("approved") ? "approved" : null;
+}
+
+// Every linked pull request, most relevant first: open (drafts after ready ones), then merged, then closed;
+// newest first within each. `status` is open | draft | merged | closed.
+export function prs(issue) {
+  const rank = { open: 0, draft: 1, merged: 2, closed: 3 };
+  return (issue?.attachments?.nodes ?? [])
     .filter((a) => prNumber(a.url) !== null)
-    .filter((a) => /^open(ed)?$/i.test(String(a.metadata?.status ?? "")))
-    .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
-  const a = open[0];
-  if (!a) return null;
-  const m = a.metadata ?? {};
-  return { url: a.url, number: typeof m.number === "number" ? m.number : prNumber(a.url), repo: m.repoName ?? null, draft: Boolean(m.draft) };
+    .map((a) => {
+      const m = a.metadata ?? {};
+      const raw = String(m.status ?? "").toLowerCase();
+      const status = raw === "merged" || m.mergedAt ? "merged"
+        : raw === "closed" || m.closedAt ? "closed"
+        : m.draft || raw === "draft" ? "draft" : "open";
+      return {
+        url: a.url, number: typeof m.number === "number" ? m.number : prNumber(a.url), repo: m.repoName ?? null,
+        status, draft: status === "draft", review: status === "open" || status === "draft" ? reviewState(m.reviews) : null,
+        conflicts: (status === "open" || status === "draft") && m.hasConflicts === true, at: a.createdAt ?? "",
+      };
+    })
+    .sort((a, b) => rank[a.status] - rank[b.status] || b.at.localeCompare(a.at));
+}
+
+// The pull request to show for an issue: the most relevant linked one, or null.
+export function mainPr(issue) {
+  return prs(issue)[0] ?? null;
+}
+
+// The linked open pull request (draft or not); the most recently linked when there are several.
+export function openPr(issue) {
+  const p = mainPr(issue);
+  return p && (p.status === "open" || p.status === "draft") ? p : null;
+}
+
+// A team's workflow states in board order.
+export async function teamStates(key, teamId) {
+  const d = await gql(key, "query States($id: String!) { team(id: $id) { states { nodes { id name type position color } } } }", { id: teamId });
+  return [...(d.team?.states?.nodes ?? [])].sort((a, b) => a.position - b.position);
+}
+
+export async function setState(key, issueId, stateId) {
+  const q = `mutation SetState($id: String!, $stateId: String!) {
+    issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { ...IssueFields } } } ${FRAGMENT}`;
+  const d = await gql(key, q, { id: issueId, stateId });
+  return d.issueUpdate?.success ? d.issueUpdate.issue : null;
+}
+
+// Posts a comment (Markdown) on an issue; the new comment in the shape issueDetail returns.
+export async function createComment(key, issueId, body) {
+  const q = `mutation Comment($issueId: String!, $body: String!) {
+    commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id name displayName } } } }`;
+  const d = await gql(key, q, { issueId, body });
+  return d.commentCreate?.success ? d.commentCreate.comment : null;
 }
