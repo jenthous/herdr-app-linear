@@ -198,3 +198,75 @@ export function issueRefs(text, teamKeys, max = 9) {
   }
   return [...last.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id).slice(0, max);
 }
+
+// ── Editing the search from the filter menu ───────────────
+// The search as raw tokens (quotes kept), each read as { kind, neg, vals } when it's a s: l: p: @ #
+// token, so the menu can show what's chosen and add or take away one value.
+
+const PREFIX = { s: "s:", l: "l:", p: "p:", "@": "@", "#": "#" };
+
+function rawTokens(s) {
+  const out = [];
+  let cur = "", q = false;
+  for (const c of s) {
+    if (c === '"') q = !q;
+    if (/\s/.test(c) && !q) { if (cur) { out.push(cur); cur = ""; } }
+    else cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function splitVals(raw) {
+  const out = [];
+  let cur = "", q = false;
+  for (const c of raw) {
+    if (c === '"') { q = !q; continue; }
+    if (c === "," && !q) { out.push(cur); cur = ""; } else cur += c;
+  }
+  out.push(cur);
+  return out.map((v) => v.trim()).filter(Boolean);
+}
+
+function readToken(tok) {
+  let neg = false, t = tok;
+  if (/^[-!]./.test(t)) { neg = true; t = t.slice(1); }
+  const m = /^(s|l|p):(.*)$/is.exec(t) ?? (/^[@#]./.test(t) ? [t, t[0], t.slice(1)] : null);
+  if (!m) return null;
+  let raw = m[2];
+  if (raw.startsWith("!")) { neg = !neg; raw = raw.slice(1); }
+  return { kind: m[1].toLowerCase(), neg, vals: splitVals(raw) };
+}
+
+const quoteVal = (v) => (/[\s,"]/.test(v) ? `"${v.replace(/"/g, "")}"` : v);
+const same = (a, b) => a.normalize("NFC").toLowerCase() === b.normalize("NFC").toLowerCase();
+
+// Values chosen for a kind, as { val, neg }.
+export function chosen(query, kind) {
+  return rawTokens(query).map(readToken).filter((t) => t?.kind === kind).flatMap((t) => t.vals.map((val) => ({ val, neg: t.neg })));
+}
+
+// Adds the value to the kind's token of that sign (or makes one), or takes it away when it's there.
+// Choosing a value with the other sign moves it.
+export function toggleValue(query, kind, neg, val) {
+  const toks = rawTokens(query);
+  const read = toks.map(readToken);
+  const had = read.some((t) => t?.kind === kind && t.neg === neg && t.vals.some((v) => same(v, val)));
+  const out = [];
+  let placed = false;
+  toks.forEach((tok, n) => {
+    const t = read[n];
+    if (t?.kind !== kind) { out.push(tok); return; }
+    let vals = t.vals.filter((v) => !same(v, val));
+    if (t.neg === neg && !had && !placed) { vals = [...vals, val]; placed = true; }
+    if (vals.length) out.push(`${t.neg ? "-" : ""}${PREFIX[kind]}${vals.map(quoteVal).join(",")}`);
+  });
+  if (!had && !placed) out.push(`${neg ? "-" : ""}${PREFIX[kind]}${quoteVal(val)}`);
+  return out.join(" ") + (out.length ? " " : "");
+}
+
+// The search without any s: l: p: @ # tokens.
+export function withoutTokens(query) {
+  const out = rawTokens(query).filter((t) => !readToken(t));
+  return out.length ? out.join(" ") + " " : "";
+}

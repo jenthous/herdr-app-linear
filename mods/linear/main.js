@@ -35,6 +35,9 @@ const TAB_IDS = ["mine", "recent", "all"];
 const IDENT_IN_NAME = /[A-Za-z][A-Za-z0-9]*-\d+/g;
 const TREE_STEP = 22, TREE_X = 7; // a sub-issue level's indent, and where its line runs (under the parent's priority icon)
 const CLOSED = new Set(["completed", "canceled", "duplicate"]);
+const SORTS = ["default", "updated", "created", "priority", "state"];
+// Board order of state types, for sorting by state: what's being worked on first, closed last.
+const STATE_RANK = { started: 0, unstarted: 1, triage: 2, backlog: 3, completed: 4, canceled: 5, duplicate: 6 };
 
 
 // "42s", "7m 05s", "1h 12m".
@@ -103,6 +106,13 @@ export default class Linear extends View {
     this.listW = LIST_W;
     this.layout = "split"; // split (list + preview) | list (the list alone, with more columns)
     this.filters = []; // saved searches: [{ query }]
+    this.sort = { by: "default", asc: false }; // list order (default: the list's own, or relevance when searching)
+    this.hideClosed = false; // Display: leave completed, canceled and duplicate issues out of the lists
+    this.nest = true; // Display: sub-issues under their parent
+    this.pop = null; // the open popover: "filter" | "display"
+    this.popField = null; // the filter menu's open field (state, assignee, …)
+    this.popNeg = false; // the filter menu adds "is not" values
+    this.popMenu = null; // the display panel's open choice (order, closed)
     this.collapsed = new Set(); // parents whose sub-issues are folded in the list
     this.dataVer = 0; this.foldVer = 0; // bumped when cached issues or folds change (rows() is memoized on them)
     this.height = 700;
@@ -136,6 +146,9 @@ export default class Linear extends View {
     this.labelInput.on("change", (_e, cx) => { if (this.labelPick) this.labelPick.sel = 0; cx.notify(); });
     this.labelInput.on("submit", (_e, cx) => this.pickLabel(cx));
 
+    this.popInput = InputState.new({ placeholder: "" });
+    this.popInput.on("change", (_e, cx) => cx.notify());
+
     this.keyInput = InputState.new({ placeholder: "lin_api_…" });
     this.keyInput.set_masked(true);
     this.keyInput.on("submit", (_e, cx) => this.saveKey(this.keyInput.value().trim(), cx));
@@ -156,6 +169,9 @@ export default class Linear extends View {
       this.listW = load("listW", LIST_W);
       this.layout = load("layout", "split");
       this.filters = load("filters", []);
+      this.sort = { by: "default", asc: false, ...load("sort", {}) };
+      this.hideClosed = load("hideClosed", false);
+      this.nest = load("nest", this.config.nestSubIssues !== false);
       this.collapsed = new Set(load("collapsed", []));
       this.cleanCache();
       if (this.config.terminalIssues !== false) {
@@ -204,6 +220,8 @@ export default class Linear extends View {
         else if (name === "refresh" && this.key) this.refresh(cx, false);
         else if (name === "demo") this.setDemo(!DEMO, cx);
         else if (name === "close") this.dismiss();
+        else if (name === "sort" && SORTS.includes(arg)) this.setSort(arg, cx);
+        else if (name === "filter" || name === "display") this.openPop(this.pop === name ? null : name, cx);
         else if (name === "layout") this.setLayout(arg === "split" || arg === "list" ? arg : this.layout === "split" ? "list" : "split", cx);
         else if (name === "open" && arg) this.openDetail(arg.toUpperCase(), cx, true);
         else if (name === "comments") { const id = this.shownId(); if (id) this.toggleComments(id, cx); }
@@ -467,7 +485,7 @@ export default class Linear extends View {
   // and a search scores every cached issue, so it's computed once per change.
   rowsKey() {
     return [this.query, this.tab, this.mine, this.all, this.all.length, this.server, this.serverFor, this.deep, this.deepFor,
-      this.found, this.recent, this.allMore, this.dataVer, this.foldVer, this.branchIssue(), DEMO];
+      this.found, this.recent, this.allMore, this.dataVer, this.foldVer, this.branchIssue(), this.sort.by, this.sort.asc, this.hideClosed, this.nest, DEMO];
   }
 
   rows() {
@@ -482,7 +500,7 @@ export default class Linear extends View {
   // Sub-issues go under their parent when both are in the list (in list order), as deep as they nest.
   // A parent in `collapsed` hides them. A sub-issue whose parent isn't in the list stays at the top level.
   nested(list, extra = {}) {
-    if (this.config.nestSubIssues === false) return list.map((issue) => ({ kind: "issue", issue, ...extra }));
+    if (!this.nest) return list.map((issue) => ({ kind: "issue", issue, ...extra }));
     const ids = new Set(list.map((i) => i.identifier));
     const kids = new Map();
     const roots = [];
@@ -516,6 +534,41 @@ export default class Linear extends View {
     return out;
   }
 
+  // The list in the chosen order; "default" keeps it as it came (the list's own order, or relevance).
+  // Ties keep their order. Sub-issues still go under their parent (nested() places a family by its
+  // best-placed member).
+  sorted(list) {
+    const { by, asc } = this.sort;
+    if (by === "default") return asc ? [...list].reverse() : list;
+    const key = {
+      updated: (i) => i.updatedAt ?? "",
+      created: (i) => i.createdAt ?? "",
+      // Urgent first and no priority last, whichever way: 1 urgent … 4 low, 0 none.
+      priority: (i) => (i.priority ? i.priority : 5),
+      state: (i) => STATE_RANK[i.state?.type] ?? 9,
+    }[by];
+    // Dates read newest first; priority and state read top of the scale first.
+    const dir = (by === "updated" || by === "created" ? -1 : 1) * (asc ? -1 : 1);
+    return list.map((i, n) => [i, key(i), n])
+      .sort((a, b) => (a[1] < b[1] ? -dir : a[1] > b[1] ? dir : 0) || (b[0].updatedAt ?? "").localeCompare(a[0].updatedAt ?? "") || a[2] - b[2])
+      .map(([i]) => i);
+  }
+
+  // Display "completed issues: hide" leaves closed ones out, unless the search asks for a state.
+  visible(list, q) {
+    if (!this.hideClosed || q.conds.some((c) => c.field === "state")) return list;
+    return list.filter((i) => !CLOSED.has(i.state?.type));
+  }
+
+  // Picking the order: another one sets it (in its natural direction), the same one flips it.
+  setSort(by, cx) {
+    this.sort = by === this.sort.by && by !== "default" ? { by, asc: !this.sort.asc } : { by, asc: false };
+    save("sort", this.sort);
+    this.sel = 0;
+    this.schedulePreview(cx);
+    cx.notify();
+  }
+
   // Sub-issues done of all, for a parent's progress ring: from its fetched detail when there is one
   // (every sub-issue), else from the sub-issues in the list. null when it has none.
   subProgress(issue, inList) {
@@ -542,7 +595,7 @@ export default class Linear extends View {
         const issue = b && !this.found.includes(b) && (this.cache[b] ?? this.details[b]?.issue);
         if (issue) { out.push({ kind: "issue", issue, pin: true }); list = list.filter((i) => i.identifier !== b); }
       }
-      out.push(...this.nested(list));
+      out.push(...this.nested(this.sorted(this.visible(list, q))));
       if (this.tab === "all" && this.allMore) out.push({ kind: "more" });
       return out;
     }
@@ -560,7 +613,7 @@ export default class Linear extends View {
     // Server results count only for the search they answered (until the new one comes back).
     if (this.serverFor === this.query) for (const i of this.server) consider(i, 0);
     const ranked = [...seen.values()].sort((a, b) => b.s - a.s || (b.i.updatedAt ?? "").localeCompare(a.i.updatedAt ?? ""));
-    out.push(...this.nested(ranked.map(({ i }) => i)));
+    out.push(...this.nested(this.sorted(this.visible(ranked.map(({ i }) => i), q))));
     if (this.deepFor === this.query) {
       const have = new Set(ranked.map(({ i }) => i.identifier));
       const extra = this.deep.filter((i) => !have.has(i.identifier));
@@ -1213,6 +1266,13 @@ export default class Linear extends View {
       else if (k === "escape") { this.closeComposer(cx); cx.stop_propagation(); }
       return;
     }
+    if (this.pop) {
+      if (k === "escape") {
+        if (this.popField) { this.popField = null; this.popInput.set_value(""); cx.notify(); } else this.openPop(null, cx);
+        cx.stop_propagation();
+      }
+      return;
+    }
     if (this.labelPick) {
       // The label filter has the keys, apart from moving through the list and leaving.
       if (k === "escape") this.closeLabels(cx);
@@ -1292,6 +1352,7 @@ export default class Linear extends View {
             .child(v_flex().size_full().min_w(0).min_h(0).child(this.shownId() ? this.detailView(t, this.shownId(), false) : this.empty(t, T().selectHint))))
         : this.listView(t);
     return root.child(this.header(t)).when(this.mode === "list", (el) => el.child(this.searchBar(t))).child(body).child(this.footer(t))
+      .when(Boolean(this.pop) && this.mode === "list", (el) => el.child(this.popView(t)))
       .when(Boolean(this.lightbox), (el) => el.child(this.lightboxView(t)));
   }
 
@@ -1337,12 +1398,185 @@ export default class Linear extends View {
 
   searchBar(t) {
     return v_flex().px(12).py(8).gap(8).flex_none().border_b(1).border_color(t.border)
-      .child(h_flex().id("l-search").h(34).flex_1().px(10).gap(8).items_center().rounded(8).border_1().border_color(t.input).bg(t.background)
+      .child(h_flex().gap(8).items_center().child(h_flex().id("l-search").h(34).flex_1().px(10).gap(8).items_center().rounded(8).border_1().border_color(t.input).bg(t.background)
         .on_mouse_down("left", stop)
         .child(svg(`${ICON}/search.svg`).size(14).text_color(t.dim))
         .child(Input.new(this.input).flex_1().h_full().text_size(12.8).text_color(t.foreground))
         .when(!this.query, (el) => el.child(div().flex_none().text_size(12).text_color(t.dim).child(T().searchPlaceholder))))
+        .child(this.popButton(t, "filter", `${ICON}/filter.svg`, T().filter, Q.parse(this.query).conds.length > 0))
+        .child(this.popButton(t, "display", `${ICON}/sliders.svg`, T().display, this.sort.by !== "default" || this.sort.asc || this.hideClosed || !this.nest)))
       .when(this.filters.length > 0 || Boolean(this.query.trim()), (el) => el.child(this.filterBar(t)));
+  }
+
+  // ── Filter and display popovers ───────────────────────
+  // Two buttons beside the search, as in Linear. Filter picks values (state, assignee, priority, label,
+  // team) and writes them into the search as tokens, so what it does stays visible and editable.
+  // Display sets the order, whether closed issues show and whether sub-issues nest.
+
+  openPop(which, cx) {
+    this.pop = which;
+    this.popField = null; this.popNeg = false; this.popMenu = null;
+    if (which === "filter") { this.popInput.set_value(""); cx.timer.after(0, () => this.popInput.focus()); }
+    else if (!which && this.mode === "list") this.input.focus();
+    cx.notify();
+  }
+
+  setDisplay(key, value, cx) {
+    this[key] = value;
+    save(key, value);
+    this.sel = 0; this.popMenu = null;
+    cx.notify();
+  }
+
+  resetDisplay(cx) {
+    this.sort = { by: "default", asc: false }; save("sort", this.sort);
+    this.setDisplay("hideClosed", false, cx);
+    this.setDisplay("nest", this.config.nestSubIssues !== false, cx);
+  }
+
+  setQuery(text, cx) {
+    this.input.set_value(text);
+    this.onQuery(text, cx);
+    cx.notify();
+  }
+
+  // What each field offers, from the loaded issues (and the viewer's teams).
+  filterValues(field) {
+    const issues = [...this.mine, ...this.all, ...Object.values(this.cache)];
+    const uniq = (list, key) => [...new Map(list.filter(Boolean).map((x) => [key(x), x])).values()];
+    if (field === "s") {
+      return uniq(issues.map((i) => i.state), (s) => s.name)
+        .sort((a, b) => (STATE_RANK[a.type] ?? 9) - (STATE_RANK[b.type] ?? 9) || a.name.localeCompare(b.name))
+        .map((s) => ({ val: s.name, label: s.name, icon: stateIcon(s), color: s.color }));
+    }
+    if (field === "@") {
+      const me = this.viewer?.id;
+      const people = uniq(issues.map((i) => i.assignee), (a) => a.id).filter((a) => a.id !== me)
+        .map((a) => a.displayName ?? a.name).sort((a, b) => a.localeCompare(b));
+      return [{ val: "me", label: T().me }, ...people.map((n) => ({ val: n, label: n }))];
+    }
+    if (field === "p") {
+      return [["urgent", 1], ["high", 2], ["medium", 3], ["low", 4], ["none", 0]].map(([val, n]) => ({ val, label: T().priority[n] ?? T().noPriority, prio: n }));
+    }
+    if (field === "l") {
+      return uniq(issues.flatMap((i) => i.labels?.nodes ?? []), (l) => l.name).sort((a, b) => a.name.localeCompare(b.name))
+        .map((l) => ({ val: l.name, label: l.name, dot: l.color }));
+    }
+    return (this.viewer?.teams?.nodes ?? []).map((tm) => ({ val: tm.key, label: `${tm.key}  ${tm.name}` }));
+  }
+
+  popButton(t, which, icon, label, dot) {
+    const open = this.pop === which;
+    return h_flex().id(`pb-${which}`).relative().size(34).flex_none().items_center().justify_center().rounded(8).border_1()
+      .border_color(open ? t.accent : t.input).bg(open ? t.selected : t.background).cursor_pointer()
+      .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+      .on_click((_e, cx) => this.openPop(open ? null : which, cx))
+      .child(svg(icon).size(15).text_color(open || dot ? t.foreground : t.muted))
+      .when(dot, (el) => el.child(div().absolute().top(4).right(4).size(7).rounded(4).bg(t.accent)));
+  }
+
+  // A popover: a transparent layer over the window (a press on it closes) and the panel under the buttons.
+  popView(t) {
+    const panel = this.pop === "filter" ? this.filterPanel(t) : this.displayPanel(t);
+    return div().absolute().inset_0()
+      .child(div().id("pop-back").absolute().inset_0().on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.openPop(null, cx); }))
+      .child(div().id("pop-panel").absolute().top(88).right(12).on_mouse_down("left", stop).on_scroll_wheel((_e, cx) => cx.stop_propagation())
+        .child(panel.rounded(10).border_1().border_color(t.border).bg(t.popover).shadow_lg()));
+  }
+
+  menuRow(t, id, on, action) {
+    return h_flex().id(id).h(30).px(10).gap(9).items_center().rounded(6).flex_none().text_size(12.5).cursor_pointer()
+      .when(on, (el) => el.bg(t.hover)).hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+      .on_click((_e, cx) => action(cx));
+  }
+
+  filterPanel(t) {
+    const tr = T();
+    const term = this.popInput.value().trim().toLowerCase();
+    const head = h_flex().h(40).px(12).gap(8).items_center().border_b(1).border_color(t.border)
+      .child(Input.new(this.popInput).flex_1().h_full().text_size(12.5))
+      .when(!this.popInput.value(), (el) => el.child(div().flex_none().text_size(12).text_color(t.dim).child(this.popField ? tr.filterFind : tr.addFilter)));
+    const FIELDS = [["s", tr.fields.state, `${ICON}/state-started.svg`], ["@", tr.fields.assignee, `${ICON}/person.svg`],
+      ["p", tr.fields.priority, `${ICON}/prio-2.svg`], ["l", tr.fields.label, `${ICON}/label.svg`], ["#", tr.fields.team, `${ICON}/team.svg`]];
+    const list = v_flex().id("pop-list").p(6).gap(1).max_h(380).overflow_y_scrollbar();
+    if (!this.popField) {
+      const fields = FIELDS.filter(([, label]) => !term || label.toLowerCase().includes(term));
+      // Typing finds values across every field too.
+      const hits = term ? FIELDS.flatMap(([f, label]) => this.filterValues(f).filter((v) => v.label.toLowerCase().includes(term)).slice(0, 6).map((v) => ({ ...v, f, fl: label }))) : [];
+      list.children(fields.map(([f, label, icon]) => this.menuRow(t, `pf-${f}`, false, (cx) => { this.popField = f; this.popInput.set_value(""); cx.notify(); })
+        .child(svg(icon).size(14).flex_none().text_color(t.muted))
+        .child(div().flex_1().child(label))
+        .when(Q.chosen(this.query, f).length > 0, (el) => el.child(div().text_size(11).text_color(t.accent).child(String(Q.chosen(this.query, f).length))))
+        .child(div().text_size(11).text_color(t.dim).child("›"))));
+      list.children(hits.map((v, n) => this.valueRow(t, v.f, v, `ph-${n}`, v.fl)));
+      if (Q.parse(this.query).conds.length) {
+        list.child(div().h(1).my(4).bg(t.border))
+          .child(this.menuRow(t, "pf-clear", false, (cx) => this.setQuery(Q.withoutTokens(this.query), cx))
+            .child(div().w(14).flex_none().text_color(t.dim).child("×")).child(div().flex_1().text_color(t.muted).child(tr.clearFilters)));
+      }
+      return v_flex().w(280).child(head).child(list);
+    }
+    const f = this.popField;
+    const label = FIELDS.find((x) => x[0] === f)?.[1] ?? "";
+    const seg = (neg, text) => h_flex().id(`pn-${neg}`).h(24).px(10).items_center().rounded(5).text_size(11.5).cursor_pointer()
+      .bg(this.popNeg === neg ? t.selected : t.popover).text_color(this.popNeg === neg ? t.foreground : t.muted)
+      .on_mouse_down("left", stop).on_click((_e, cx) => { this.popNeg = neg; cx.notify(); }).child(text);
+    const bar = h_flex().h(38).px(8).gap(8).items_center().border_b(1).border_color(t.border)
+      .child(h_flex().id("pf-back").h(26).px(6).gap(4).items_center().rounded(6).text_size(12.5).font_semibold().cursor_pointer()
+        .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+        .on_click((_e, cx) => { this.popField = null; this.popInput.set_value(""); cx.notify(); }).child("‹").child(label))
+      .child(div().flex_1())
+      .child(h_flex().p(2).gap(2).rounded(7).border_1().border_color(t.border).child(seg(false, tr.is)).child(seg(true, tr.isNot)));
+    const vals = this.filterValues(f).filter((v) => !term || v.label.toLowerCase().includes(term));
+    list.children(vals.map((v, n) => this.valueRow(t, f, v, `pv-${n}`)));
+    if (!vals.length) list.child(div().p(10).text_size(12).text_color(t.dim).child(tr.noMatch));
+    return v_flex().w(280).child(bar).child(head).child(list);
+  }
+
+  // One value: ✓ when it's in the search with the sign being added (⊘ when it's there as "is not").
+  valueRow(t, f, v, id, fieldLabel) {
+    const got = Q.chosen(this.query, f).find((c) => c.val.toLowerCase() === v.val.toLowerCase());
+    const on = got && got.neg === this.popNeg;
+    return this.menuRow(t, id, false, (cx) => this.setQuery(Q.toggleValue(this.query, f, this.popNeg, v.val), cx))
+      .child(div().w(14).flex_none().text_size(12).text_color(got ? (got.neg ? t.blocked : t.accent) : t.dim).child(got ? (got.neg ? "⊘" : "✓") : ""))
+      .when(Boolean(v.icon), (el) => el.child(svg(v.icon).size(13).flex_none().text_color(v.color ?? t.dim)))
+      .when(v.prio !== undefined, (el) => el.child(this.prioIcon(t, v.prio)))
+      .when(Boolean(v.dot), (el) => el.child(div().size(8).flex_none().rounded(4).bg(v.dot)))
+      .child(div().flex_1().min_w(0).truncate().text_color(on ? t.foreground : t.muted).child(v.label))
+      .when(Boolean(fieldLabel), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(fieldLabel)));
+  }
+
+  displayPanel(t) {
+    const tr = T();
+    const select = (id, text, menu) => h_flex().id(id).h(28).px(10).gap(8).items_center().rounded(6).border_1()
+      .border_color(this.popMenu === menu ? t.accent : t.border).bg(t.background).text_size(12.5).cursor_pointer()
+      .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+      .on_click((_e, cx) => { this.popMenu = this.popMenu === menu ? null : menu; cx.notify(); })
+      .child(div().min_w(96).child(text)).child(div().text_size(10).text_color(t.dim).child("▾"));
+    const row = (label, ...right) => h_flex().h(40).px(14).gap(8).items_center()
+      .child(div().flex_1().text_size(12.5).text_color(t.muted).child(label)).children(right);
+    const options = (menu, list, cur, pick) => this.popMenu !== menu ? null
+      : v_flex().mx(10).mb(6).p(4).gap(1).rounded(8).border_1().border_color(t.border).bg(t.surface)
+        .children(list.map(([key, text]) => this.menuRow(t, `pm-${menu}-${key}`, key === cur, (cx) => pick(key, cx))
+          .child(div().w(14).flex_none().text_color(t.accent).child(key === cur ? "✓" : "")).child(div().flex_1().child(text))));
+    const dir = h_flex().id("pd-dir").size(28).items_center().justify_center().rounded(6).border_1().border_color(t.border).cursor_pointer()
+      .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+      .on_click((_e, cx) => { this.sort = { ...this.sort, asc: !this.sort.asc }; save("sort", this.sort); this.sel = 0; cx.notify(); })
+      .child(div().text_size(13).text_color(t.foreground).child(this.sort.asc ? "↑" : "↓"));
+    const toggle = h_flex().id("pd-nest").w(36).h(20).p(2).rounded(10).cursor_pointer().bg(this.nest ? t.accent : t.border)
+      .when(this.nest, (el) => el.justify_end()).on_mouse_down("left", stop)
+      .on_click((_e, cx) => this.setDisplay("nest", !this.nest, cx))
+      .child(div().size(16).rounded(8).bg("#ffffff"));
+    const orderOpts = options("order", SORTS.map((k) => [k, tr.sort[k]]), this.sort.by, (k, cx) => { this.sort = { by: k, asc: false }; save("sort", this.sort); this.sel = 0; this.popMenu = null; cx.notify(); });
+    const closedOpts = options("closed", [["all", tr.closedAll], ["hide", tr.closedHide]], this.hideClosed ? "hide" : "all", (k, cx) => this.setDisplay("hideClosed", k === "hide", cx));
+    return v_flex().w(320).py(6)
+      .child(row(tr.ordering, dir, select("pd-order", tr.sort[this.sort.by], "order")))
+      .when(Boolean(orderOpts), (el) => el.child(orderOpts))
+      .child(row(tr.closedIssues, select("pd-closed", this.hideClosed ? tr.closedHide : tr.closedAll, "closed")))
+      .when(Boolean(closedOpts), (el) => el.child(closedOpts))
+      .child(row(tr.nestSub, toggle))
+      .child(h_flex().mt(4).px(14).pt(8).border_t(1).border_color(t.border).justify_end()
+        .child(this.button(t, "pd-reset", tr.reset, (cx) => this.resetDisplay(cx))));
   }
 
   // Saved filters as pills; the active one is selected and has × to remove it. "+ Save" for a new search.
@@ -1397,7 +1631,7 @@ export default class Linear extends View {
     const pr = api.mainPr(i);
     // The list's own width: beside the preview it's the left panel, else the window.
     const w = this.width >= WIDE && this.layout === "split" && this.mode === "list" ? this.listW : this.width;
-    const nest = this.config.nestSubIssues !== false && r.depth !== undefined;
+    const nest = this.nest && r.depth !== undefined;
     // Done and canceled issues fade, so open work stands out.
     const closed = CLOSED.has(i.state?.type);
     const labels = (i.labels?.nodes ?? []).slice(0, 2);
