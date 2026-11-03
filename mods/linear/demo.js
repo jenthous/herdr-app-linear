@@ -92,7 +92,8 @@ const others = [
 const byId = Object.fromEntries([...mine, ...others].map((i) => [i.identifier, i]));
 const rel = (id) => ({ id: byId[id].id, identifier: id, title: byId[id].title, state: byId[id].state });
 
-const comment = (id, who, mins, body) => ({ id, body, createdAt: at(mins), editedAt: null, user: who });
+const comment = (id, who, mins, body, extra = {}) => ({ id, body, createdAt: at(mins), editedAt: null, user: who, parent: null, reactionData: [], ...extra });
+const reacted = (emoji, ...who) => ({ emoji, reactions: who.map((p, n) => ({ id: `r-${emoji}-${n}`, userId: p.id, reactedAt: at(10) })) });
 
 // Where the agent picker offers to work (fake spaces; nothing starts in demo mode).
 const sp = (name, machine) => ({ id: `s-${name}`, name, machine });
@@ -118,7 +119,9 @@ export const demo = {
       issue: byId["ENG-142"],
       comments: [
         comment("dc1", PEOPLE.mia, 300, "Reproduced on iOS with a 5 minute token lifetime. The cart request fires about 40 ms before the refresh lands."),
-        comment("dc2", PEOPLE.leo, 90, "The 401 handler in `session.ts` clears everything. Retrying once with the new token should be enough.\n\n```ts\nif (res.status === 401 && refreshed) return retry(req)\n```"),
+        comment("dc2", PEOPLE.leo, 90, "The 401 handler in `session.ts` clears everything. Retrying once with the new token should be enough.\n\n```ts\nif (res.status === 401 && refreshed) return retry(req)\n```",
+          { reactionData: [reacted("+1", PEOPLE.mia, PEOPLE.me), reacted("eyes", PEOPLE.mia)] }),
+        comment("dc2r", PEOPLE.mia, 60, "Agreed, one retry. More than that hides real logouts.", { parent: { id: "dc2" } }),
         comment("dc3", PEOPLE.me, 20, "PR is up: acme/web#1873. Added a test that refreshes the token while the sheet is open."),
       ],
       moreComments: false,

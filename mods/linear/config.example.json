@@ -7,5 +7,6 @@
   "autoState": true,
   "taskContext": true,
   "terminalIssues": true,
-  "nestSubIssues": true
+  "nestSubIssues": true,
+  "cacheDays": 30
 }

@@ -120,7 +120,7 @@ function hash(s) {
 const SCRIPT = `
 b="$2"
 for f in "$b".png "$b".jpg "$b".gif "$b".webp "$b".svg; do
-  if [ -f "$f" ]; then e="\${f##*.}"; break; fi
+  if [ -f "$f" ]; then e="\${f##*.}"; touch "$f"; break; fi
 done
 if [ -z "$e" ]; then
   if [ "$4" = 1 ]; then curl -sfL --max-time 25 -H @"$3" -o "$b.tmp" "$1" || { rm -f "$b.tmp"; echo "ERR download"; exit 2; }

@@ -4,7 +4,7 @@ import { readTextFile, home, exec } from "herdr";
 
 const ENDPOINT = "https://api.linear.app/graphql";
 export const PAGE_SIZE = 50;
-const COMMENT_PAGE_SIZE = 50;
+const COMMENT_PAGE_SIZE = 100;
 const RELATION_PAGE_SIZE = 50;
 const DEEP_SEARCH_SIZE = 20;
 
@@ -67,6 +67,7 @@ export async function gql(key, query, variables = {}) {
 }
 
 const RELATED = "id identifier title state { id name type color }";
+const COMMENT = "id body createdAt editedAt parent { id } reactionData user { id name displayName }";
 const ISSUE = `id identifier number title description priority url branchName dueDate createdAt updatedAt archivedAt trashed
   team { id key name } state { id name type color } assignee { id name displayName } project { id name }
   cycle { id number name } parent { ${RELATED} } labels(first: 20) { nodes { id name color } }
@@ -118,7 +119,8 @@ function detailQuery(withRelations) {
         inverseRelations(first: ${RELATION_PAGE_SIZE}) { nodes { type issue { ${RELATED} } } }`
     : "";
   return `query Detail($id: String!, $first: Int) { issue(id: $id) { ...IssueFields
-    comments(first: $first) { nodes { id body createdAt editedAt user { id name displayName } } pageInfo { hasNextPage } }${rel} } } ${FRAGMENT}`;
+    reactionData
+    comments(first: $first) { nodes { ${COMMENT} } pageInfo { hasNextPage } }${rel} } } ${FRAGMENT}`;
 }
 
 // An issue with comments, sub-issues and relations. `id` is a UUID or an identifier (ENG-123).
@@ -223,10 +225,59 @@ export async function setState(key, issueId, stateId) {
   return d.issueUpdate?.success ? d.issueUpdate.issue : null;
 }
 
-// Posts a comment (Markdown) on an issue; the new comment in the shape issueDetail returns.
-export async function createComment(key, issueId, body) {
-  const q = `mutation Comment($issueId: String!, $body: String!) {
-    commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id name displayName } } } }`;
-  const d = await gql(key, q, { issueId, body });
+// Posts a comment (Markdown) on an issue, or a reply when parentId is given; the new comment in the
+// shape issueDetail returns.
+export async function createComment(key, issueId, body, parentId = null) {
+  const q = `mutation Comment($input: CommentCreateInput!) {
+    commentCreate(input: $input) { success comment { ${COMMENT} } } }`;
+  const input = { issueId, body };
+  if (parentId) input.parentId = parentId;
+  const d = await gql(key, q, { input });
   return d.commentCreate?.success ? d.commentCreate.comment : null;
+}
+
+export async function updateComment(key, id, body) {
+  const q = `mutation EditComment($id: String!, $body: String!) {
+    commentUpdate(id: $id, input: { body: $body }) { success comment { ${COMMENT} } } }`;
+  const d = await gql(key, q, { id, body });
+  return d.commentUpdate?.success ? d.commentUpdate.comment : null;
+}
+
+// A reaction on a comment ({ commentId }) or on the issue itself ({ issueId }). `emoji` is Linear's
+// name for it ("+1", "heart"). Returns the new reaction's id.
+export async function addReaction(key, target, emoji) {
+  const q = `mutation React($input: ReactionCreateInput!) { reactionCreate(input: $input) { success reaction { id } } }`;
+  const d = await gql(key, q, { input: { ...target, emoji } });
+  return d.reactionCreate?.success ? d.reactionCreate.reaction.id : null;
+}
+
+export async function removeReaction(key, id) {
+  const d = await gql(key, `mutation Unreact($id: String!) { reactionDelete(id: $id) { success } }`, { id });
+  return d.reactionDelete?.success ?? false;
+}
+
+// Labels an issue of this team can take: the team's and the workspace's, groups left out (their
+// children are what gets applied). Sorted by name.
+export async function teamLabels(key, teamId) {
+  const q = `query Labels($id: String!) { team(id: $id) {
+    labels(first: 250) { nodes { id name color isGroup parent { id name } } } } }`;
+  const d = await gql(key, q, { id: teamId });
+  return (d.team?.labels?.nodes ?? []).filter((l) => !l.isGroup)
+    .sort((a, b) => (a.parent?.name ?? a.name).localeCompare(b.parent?.name ?? b.name) || a.name.localeCompare(b.name));
+}
+
+// Adds or removes one label; the updated issue.
+export async function setLabel(key, issueId, labelId, on) {
+  const m = on ? "issueAddLabel" : "issueRemoveLabel";
+  const q = `mutation Label($id: String!, $labelId: String!) {
+    ${m}(id: $id, labelId: $labelId) { success issue { ...IssueFields } } } ${FRAGMENT}`;
+  const d = await gql(key, q, { id: issueId, labelId });
+  return d[m]?.success ? d[m].issue : null;
+}
+
+export async function createLabel(key, teamId, name, color) {
+  const q = `mutation NewLabel($input: IssueLabelCreateInput!) {
+    issueLabelCreate(input: $input) { success issueLabel { id name color isGroup parent { id name } } } }`;
+  const d = await gql(key, q, { input: { teamId, name, color } });
+  return d.issueLabelCreate?.success ? d.issueLabelCreate.issueLabel : null;
 }

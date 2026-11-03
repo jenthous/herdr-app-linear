@@ -16,6 +16,7 @@ import { T, setLanguage } from "./i18n.js";
 import { demo } from "./demo.js";
 import { Places } from "./places.js";
 import { stateIcon } from "./states.js";
+import * as Doc from "./doc.js";
 
 const BASE = "mods/linear";
 const ICON = `${BASE}/icons`;
@@ -68,7 +69,7 @@ const stop = (_e, cx) => cx.stop_propagation();
 
 export default class Linear extends View {
   init(_props, cx) {
-    this.config = { agent: ["claude"], agentName: null, refreshSeconds: 60, autoState: true, taskContext: true };
+    this.config = { agent: ["claude"], agentName: null, refreshSeconds: 60, autoState: true, taskContext: true, cacheDays: 30 };
     this.states = {}; // team id → workflow states
     this.key = null;
     this.viewer = null;
@@ -89,7 +90,10 @@ export default class Linear extends View {
     this.sel = 0;
     this.mode = "list"; // list | detail
     this.stack = []; // issues followed through relations in the detail view
-    this.section = "body"; // body | comments
+    this.sc = {}; // issue id → the detail's scroll: offset, measured heights, outline state
+    this.reactFor = null; // which reaction picker is open: "issue" or "c-<comment id>"
+    this.labelPick = null; // { id, sel }: the label picker under the issue's labels
+    this.labels = {}; // team id → labels it can take
     this.places = new Places();
     this.pick = null; // { issue, sel }: choosing where the agent works
     this.status = null; // { text, level }
@@ -119,13 +123,18 @@ export default class Linear extends View {
     this.draft = TextareaState.new({ rows: 3 });
     this.draft.set_auto_grow(3, 12);
     this.draftFor = null;
-    this.drafts = {};
+    this.draftMode = { mode: "new" }; // new | reply (parentId, who) | edit (commentId, body)
+    this.drafts = {}; // draftKey → text
     this.composing = false; // the textarea has the keyboard
     this.sending = false;
-    this.draft.on("change", (_e, cx) => { if (this.draftFor) this.drafts[this.draftFor] = this.draft.value(); cx.notify(); });
+    this.draft.on("change", (_e, cx) => { if (this.draftFor) this.drafts[this.draftKey(this.draftFor, this.draftMode)] = this.draft.value(); cx.notify(); });
     this.draft.on("submit", (e, cx) => { if (e?.secondary) this.sendComment(cx); });
     this.draft.on("focus", (_e, cx) => { this.composing = true; cx.notify(); });
     this.draft.on("blur", (_e, cx) => { this.composing = false; cx.notify(); });
+
+    this.labelInput = InputState.new({ placeholder: "" });
+    this.labelInput.on("change", (_e, cx) => { if (this.labelPick) this.labelPick.sel = 0; cx.notify(); });
+    this.labelInput.on("submit", (_e, cx) => this.pickLabel(cx));
 
     this.keyInput = InputState.new({ placeholder: "lin_api_…" });
     this.keyInput.set_masked(true);
@@ -148,6 +157,7 @@ export default class Linear extends View {
       this.layout = load("layout", "split");
       this.filters = load("filters", []);
       this.collapsed = new Set(load("collapsed", []));
+      this.cleanCache();
       if (this.config.terminalIssues !== false) {
         this.foundIds = Q.issueRefs(await termText, (this.viewer?.teams?.nodes ?? []).map((t) => t.key));
         this.found = this.foundIds.filter((id) => this.cache[id]);
@@ -160,7 +170,7 @@ export default class Linear extends View {
       this.fetchFound(cx);
       // The shown issue's comments first: requests queue in the runtime, and the lists are big.
       const shown = this.shownId();
-      if (shown) await this.loadDetail(cx, shown);
+      if (shown) await this.loadDetail(cx, shown, true);
       await this.refresh(cx, true);
       await this.prefetchDetails(cx);
       await this.places.scanAll();
@@ -196,7 +206,9 @@ export default class Linear extends View {
         else if (name === "close") this.dismiss();
         else if (name === "layout") this.setLayout(arg === "split" || arg === "list" ? arg : this.layout === "split" ? "list" : "split", cx);
         else if (name === "open" && arg) this.openDetail(arg.toUpperCase(), cx, true);
-        else if (name === "comments") this.section = this.section === "comments" ? "body" : "comments";
+        else if (name === "comments") { const id = this.shownId(); if (id) this.toggleComments(id, cx); }
+        else if (name === "jump" && arg) { const id = this.shownId(); const key = /^jump[:\s](.*)$/s.exec(String(c))?.[1]; if (id && key) this.jump(id, key, cx); }
+        else if (name === "labels") { const id = this.shownId(); if (id) this.openLabels(id, cx); }
         else if (name === "comment") { const id = this.shownId(); if (id) this.openComposer(id, cx); }
         else if (name === "image") { const g = this.gallery(); if (g.length) this.openLightbox(g[0], cx); }
         else if (name === "work") { const id = this.shownId(); const i = id && (this.details[id]?.issue ?? this.cache[id]); if (i) this.work(i, cx); }
@@ -571,7 +583,6 @@ export default class Linear extends View {
     const n = this.pickable().length;
     if (!n) return;
     this.sel = Math.max(0, Math.min(n - 1, this.sel + d));
-    this.section = "body";
     this.schedulePreview(cx);
     cx.notify();
   }
@@ -667,7 +678,6 @@ export default class Linear extends View {
 
   openDetail(id, cx, reset) {
     this.stack = reset ? [id] : [...this.stack, id];
-    this.section = "body";
     this.mode = "detail";
     this.recent = [id, ...this.recent.filter((x) => x !== id)].slice(0, RECENT_MAX);
     save("recent", this.recent);
@@ -833,27 +843,40 @@ export default class Linear extends View {
   // m (or the button under the comments) opens the composer for the shown issue, with what was typed
   // for it before. ⌘Enter posts, Esc leaves it (an empty draft closes; a typed one stays for later).
 
-  openComposer(id, cx) {
-    if (this.draftFor !== id) {
-      if (this.draftFor && !this.draft.value().trim()) delete this.drafts[this.draftFor];
+  draftKey(id, m) { return m?.mode === "reply" ? `${id}:r:${m.parentId}` : m?.mode === "edit" ? `${id}:e:${m.commentId}` : id; }
+
+  // Opens the composer for a new comment, a reply (mode: { mode: "reply", parentId, who }) or an edit of
+  // my comment ({ mode: "edit", commentId, body }). What was typed for another one stays as its draft.
+  openComposer(id, cx, mode = { mode: "new" }) {
+    const key = this.draftKey(id, mode);
+    if (this.draftFor !== id || this.draftKey(id, this.draftMode) !== key) {
+      if (this.draftFor && !this.draft.value().trim()) delete this.drafts[this.draftKey(this.draftFor, this.draftMode)];
       this.draftFor = id;
-      this.draft.set_value(this.drafts[id] ?? "");
+      this.draftMode = mode;
+      this.draft.set_value(this.drafts[key] ?? (mode.mode === "edit" ? mode.body ?? "" : ""));
     }
-    this.section = "comments";
+    this.reactFor = null;
     // After this key press is done, so the "m" that opened it isn't typed into it.
     cx.timer.after(0, () => this.draft.focus());
     cx.notify();
   }
 
   closeComposer(cx) {
-    if (!this.draft.value().trim()) { delete this.drafts[this.draftFor]; this.draftFor = null; }
+    if (!this.draft.value().trim()) { delete this.drafts[this.draftKey(this.draftFor, this.draftMode)]; this.draftFor = null; this.draftMode = { mode: "new" }; }
     this.composing = false;
     if (this.mode === "list" && !this.pick) this.input.focus(); else this.handle.focus();
     cx.notify();
   }
 
+  discardDraft(cx) {
+    if (this.draftFor) delete this.drafts[this.draftKey(this.draftFor, this.draftMode)];
+    this.draft.set_value("");
+    this.draftFor = null; this.draftMode = { mode: "new" };
+    this.closeComposer(cx);
+  }
+
   sendComment(cx) {
-    const id = this.draftFor;
+    const id = this.draftFor, m = this.draftMode;
     const body = this.draft.value().trim();
     if (!id || this.sending) return;
     if (!body) { this.say(T().commentEmpty, cx); return; }
@@ -863,19 +886,28 @@ export default class Linear extends View {
     this.say(T().commentSending, cx);
     cx.spawn(async (cx) => {
       try {
-        const c = DEMO
-          ? { id: `demo-c-${Date.now()}`, body, createdAt: new Date().toISOString(), editedAt: null, user: this.viewer }
-          : await api.createComment(this.key, issue.id, body);
+        const now = new Date().toISOString();
+        let c;
+        if (m.mode === "edit") {
+          c = DEMO ? { ...this.details[id]?.comments.find((x) => x.id === m.commentId), body, editedAt: now } : await api.updateComment(this.key, m.commentId, body);
+        } else {
+          const parentId = m.mode === "reply" ? m.parentId : null;
+          c = DEMO
+            ? { id: `demo-c-${Date.now()}`, body, createdAt: now, editedAt: null, parent: parentId ? { id: parentId } : null, reactionData: [], user: this.viewer }
+            : await api.createComment(this.key, issue.id, body, parentId);
+        }
         if (!c) throw new Error(T().err.graphql);
         const d = this.details[id];
-        if (d && !d.comments.some((x) => x.id === c.id)) d.comments = [...d.comments, c];
-        delete this.drafts[id];
-        if (this.draftFor === id) {
+        if (d) d.comments = d.comments.some((x) => x.id === c.id) ? d.comments.map((x) => (x.id === c.id ? c : x)) : [...d.comments, c];
+        delete this.drafts[this.draftKey(id, m)];
+        if (this.draftFor === id && this.draftKey(id, this.draftMode) === this.draftKey(id, m)) {
           this.draft.set_value("");
-          this.draftFor = null;
+          this.draftFor = null; this.draftMode = { mode: "new" };
           if (this.composing) this.closeComposer(cx);
         }
-        this.say(T().commentSent(id), cx, "success");
+        // A new comment is at the end: show the comments; a reply or an edit stays where it was.
+        if (m.mode === "new") this.jump(id, "end", cx);
+        this.say(m.mode === "edit" ? T().commentEdited : m.mode === "reply" ? T().replySent(id) : T().commentSent(id), cx, "success");
         if (!DEMO) this.loadDetail(cx, id, true);
       } catch (e) {
         // The draft stays, so nothing typed is lost.
@@ -887,23 +919,235 @@ export default class Linear extends View {
     });
   }
 
+  // ── Reactions ─────────────────────────────────────────
+  // On a comment (commentId) or on the issue. Shown at once; put back if Linear refuses.
+
+  reactionHolder(id, commentId) {
+    const d = this.details[id];
+    return commentId ? d?.comments.find((c) => c.id === commentId) : d?.issue;
+  }
+
+  toggleReaction(id, commentId, name, cx) {
+    const me = this.viewer?.id;
+    const h = this.reactionHolder(id, commentId);
+    if (!me || !h) return;
+    const before = h.reactionData;
+    const mine = Doc.reactionGroups(before, me).find((g) => g.emoji === name)?.mine;
+    this.reactFor = null;
+    if (mine === "pending") return;
+    h.reactionData = Doc.withReaction(before, name, me, mine ? null : "pending");
+    cx.notify();
+    if (DEMO) { if (!mine) h.reactionData = Doc.withReaction(h.reactionData, name, me, `demo-r-${Date.now()}`); return; }
+    const issueId = this.details[id]?.issue?.id;
+    cx.spawn(async (cx) => {
+      try {
+        if (mine) { if (!(await api.removeReaction(this.key, mine))) throw new Error(T().err.graphql); }
+        else {
+          const rid = await api.addReaction(this.key, commentId ? { commentId } : { issueId }, name);
+          if (!rid) throw new Error(T().err.graphql);
+          const cur = this.reactionHolder(id, commentId);
+          if (cur) cur.reactionData = Doc.withReaction(cur.reactionData, name, me, rid);
+        }
+      } catch (e) {
+        const cur = this.reactionHolder(id, commentId);
+        if (cur) cur.reactionData = before;
+        this.say(`${T().reactFailed}: ${T().err[e?.kind] ?? e?.message ?? e}`, cx, "error");
+      }
+      cx.notify();
+    });
+  }
+
+  // ── Labels ────────────────────────────────────────────
+  // l (or "+ Label") opens a picker under the labels: type to filter, Enter or a click adds or removes
+  // one, and a name no label has can be created for the team.
+
+  openLabels(id, cx) {
+    const issue = this.details[id]?.issue ?? this.cache[id];
+    const team = issue?.team?.id;
+    if (!team) return;
+    this.labelPick = { id, sel: 0 };
+    this.labelInput.set_value("");
+    if (!this.labels[team] && !DEMO) {
+      cx.spawn(async (cx) => {
+        const list = await this.call(cx, `labels:${team}`, () => api.teamLabels(this.key, team));
+        if (list) this.labels[team] = list;
+        cx.notify();
+      });
+    }
+    if (DEMO && !this.labels[team]) this.labels[team] = [...new Map(this.all.flatMap((i) => i.labels?.nodes ?? []).map((l) => [l.id, l])).values()];
+    cx.timer.after(0, () => this.labelInput.focus());
+    cx.notify();
+  }
+
+  closeLabels(cx) {
+    this.labelPick = null;
+    this.handle.focus();
+    cx.notify();
+  }
+
+  labelName(l) { return l.parent ? `${l.parent.name} / ${l.name}` : l.name; }
+
+  // What the picker lists: matching labels (the issue's own first when nothing is typed), then
+  // "create" when the typed name isn't a label yet.
+  labelChoices(issue) {
+    const q = this.labelInput.value().trim();
+    const all = this.labels[issue.team?.id] ?? [];
+    const on = new Set((issue.labels?.nodes ?? []).map((l) => l.id));
+    const lq = q.toLowerCase();
+    let list = all.filter((l) => !lq || this.labelName(l).toLowerCase().includes(lq)).map((l) => ({ kind: "label", label: l, on: on.has(l.id) }));
+    if (!lq) list = [...list.filter((x) => x.on), ...list.filter((x) => !x.on)];
+    if (q && !all.some((l) => l.name.toLowerCase() === lq)) list.push({ kind: "create", name: q });
+    return list;
+  }
+
+  pickLabel(cx, choice) {
+    const p = this.labelPick;
+    if (!p) return;
+    const issue = this.details[p.id]?.issue ?? this.cache[p.id];
+    if (!issue) return;
+    const list = this.labelChoices(issue);
+    const c = choice ?? list[Math.min(p.sel, list.length - 1)];
+    if (!c) return;
+    if (c.kind === "create") this.createLabel(p.id, c.name, cx);
+    else this.setLabel(p.id, c.label, !c.on, cx);
+  }
+
+  // Puts the label on the issue (or takes it off) here at once, then in Linear.
+  setLabel(id, label, on, cx) {
+    const issue = this.details[id]?.issue ?? this.cache[id];
+    if (!issue?.id) return;
+    const before = issue.labels;
+    const nodes = (before?.nodes ?? []).filter((l) => l.id !== label.id);
+    const apply = (labels) => {
+      for (const i of [this.details[id]?.issue, this.cache[id]]) if (i) i.labels = labels;
+      this.dataVer++;
+    };
+    apply({ nodes: on ? [...nodes, { id: label.id, name: label.name, color: label.color }] : nodes });
+    this.labelInput.set_value("");
+    cx.notify();
+    if (DEMO) return;
+    cx.spawn(async (cx) => {
+      try {
+        const upd = await api.setLabel(this.key, issue.id, label.id, on);
+        if (!upd) throw new Error(T().err.graphql);
+        apply(upd.labels);
+        this.say(on ? T().labelAdded(this.labelName(label)) : T().labelRemoved(this.labelName(label)), cx, "success");
+      } catch (e) {
+        apply(before);
+        this.say(`${T().labelFailed}: ${T().err[e?.kind] ?? e?.message ?? e}`, cx, "error");
+      }
+      cx.notify();
+    });
+  }
+
+  createLabel(id, name, cx) {
+    const issue = this.details[id]?.issue ?? this.cache[id];
+    const team = issue?.team?.id;
+    if (!team || DEMO) return;
+    const colors = ["#5e6ad2", "#26b5ce", "#4cb782", "#f2c94c", "#f2994a", "#eb5757", "#bb87fc", "#95a2b3"];
+    const color = colors[Math.floor(Math.random() * colors.length)];
+    cx.spawn(async (cx) => {
+      try {
+        const l = await api.createLabel(this.key, team, name, color);
+        if (!l) throw new Error(T().err.graphql);
+        this.labels[team] = [...(this.labels[team] ?? []), l];
+        this.setLabel(id, l, true, cx);
+      } catch (e) {
+        this.say(`${T().labelFailed}: ${T().err[e?.kind] ?? e?.message ?? e}`, cx, "error");
+      }
+      cx.notify();
+    });
+  }
+
+  // ── Outline ───────────────────────────────────────────
+  // The detail scrolls by our own offset (a plain scroll area can't be moved from code): the wheel moves
+  // it, each item reports its height, so we know where every heading and thread is. The outline marks
+  // the one at the top of the view and the ones on screen, follows as the page scrolls, and a click
+  // scrolls the page to that item.
+
+  scrollOf(id) {
+    if (!this.sc[id]) this.sc[id] = { y: 0, view: 0, content: 0, h: {}, tops: {}, keys: ["top"], active: "top", ol: 0, olView: 0, olFollow: null };
+    return this.sc[id];
+  }
+
+  maxScroll(S) { return Math.max(0, S.content - S.view); }
+
+  scrollTo(id, y, cx) {
+    const S = this.scrollOf(id);
+    const next = Math.max(0, Math.min(this.maxScroll(S), y));
+    if (Math.abs(next - S.y) < 0.5) return;
+    S.y = next;
+    cx.notify();
+  }
+
+  scrollBy(id, d, cx) { const S = this.scrollOf(id); this.scrollTo(id, Math.min(S.y, this.maxScroll(S)) + d, cx); }
+
+  jump(id, key, cx) {
+    const S = this.scrollOf(id);
+    this.reactFor = null;
+    if (key === "end") S.y = Infinity; // clamped once the height is known
+    else S.y = key === "top" ? 0 : Math.max(0, (S.tops[key] ?? 0) - 8);
+    S.olFollow = null;
+    cx.notify();
+  }
+
+  // Tab: to the comments, or back to the top when already there.
+  toggleComments(id, cx) {
+    const S = this.scrollOf(id);
+    const at = S.keys.indexOf(S.active), c = S.keys.indexOf("cmts");
+    this.jump(id, c >= 0 && at >= c ? "top" : "cmts", cx);
+  }
+
+  stepOutline(id, dir, cx) {
+    const S = this.scrollOf(id);
+    const n = S.keys.indexOf(S.active);
+    this.jump(id, S.keys[Math.max(0, Math.min(S.keys.length - 1, (n < 0 ? 0 : n) + dir))], cx);
+  }
+
+  // Records an element's height; true when it changed.
+  measured(map, key, h) {
+    if (Math.abs((map[key] ?? -1) - h) <= 0.5) return false;
+    map[key] = h;
+    return true;
+  }
+
+  // ── Cache ─────────────────────────────────────────────
+  // What's kept on disk is what was used in the last cacheDays (30): older details and cached issues
+  // (not mine or recently opened) are dropped, and images not shown since are deleted.
+
+  cleanCache() {
+    if (DEMO) return;
+    const days = Math.max(1, Number(this.config.cacheDays) || 30);
+    const cut = Date.now() - days * 864e5;
+    const keep = new Set([...this.recent, ...this.mine.map((i) => i.identifier)]);
+    const details = Object.fromEntries(Object.entries(this.details).filter(([, d]) => (d?.at ?? 0) >= cut));
+    if (Object.keys(details).length !== Object.keys(this.details).length) { this.details = details; save("details", details); }
+    const cache = Object.fromEntries(Object.entries(this.cache).filter(([k, i]) => keep.has(k) || Date.parse(i?.updatedAt ?? "") >= cut));
+    if (Object.keys(cache).length !== Object.keys(this.cache).length) { this.cache = cache; save("cache", cache); }
+    exec("sh", ["-c", 'find "$1" -maxdepth 1 -type f ! -name data.json ! -name auth-header -mtime +"$2" -delete', "sh", `${appHome()}/${BASE}/.cache`, String(days)]).catch(() => {});
+  }
+
+  // Pinned under the detail view, so it's on screen however long the comments are.
   composerView(t, id) {
     const tr = T();
+    const bar = h_flex().flex_none().px(16).py(10).border_t(1).border_color(t.border).bg(t.popover);
     if (this.draftFor !== id) {
-      return h_flex().id(`c-new-${id}`).h(34).px(12).items_center().rounded(8).border_1().border_color(t.border)
+      return bar.child(h_flex().id(`c-new-${id}`).flex_1().h(34).px(12).items_center().rounded(8).border_1().border_color(t.border)
         .text_size(12).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.muted))
         .on_mouse_down("left", stop).on_click((_e, cx) => this.openComposer(id, cx))
-        .child(div().flex_1().child(tr.commentPrompt)).child(div().text_size(11).child("m"));
+        .child(div().flex_1().child(tr.commentPrompt)).child(div().text_size(11).child("m")));
     }
+    const m = this.draftMode;
     const empty = !this.draft.value().trim();
-    return v_flex().gap(8)
-      .child(div().id(`c-draft-${id}`).w_full().on_mouse_down("left", stop).child(Textarea.new(this.draft)))
-      .child(h_flex().gap(8).items_center()
-        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(tr.commentHint))
-        .child(this.button(t, "c-cancel", tr.cancel, (cx) => {
-          this.draft.set_value(""); delete this.drafts[id]; this.draftFor = null; this.closeComposer(cx);
-        }))
-        .child(this.button(t, "c-send", this.sending ? tr.commentSending : tr.commentSend, (cx) => this.sendComment(cx), !empty && !this.sending)));
+    const title = m.mode === "reply" ? tr.replyTo(m.who ?? "") : m.mode === "edit" ? tr.editing : tr.newComment;
+    return v_flex().flex_none().gap(8).px(16).py(10).border_t(1).border_color(t.border).bg(t.popover)
+      .child(h_flex().gap(8).items_center().text_size(11.5)
+        .child(div().flex_1().min_w(0).truncate().font_semibold().text_color(m.mode === "new" ? t.muted : t.accent).child(title)))
+      .child(div().id(`c-draft-${id}`).w_full().min_w(0).rounded(8).border_1().border_color(this.composing ? t.accent : t.border).bg(t.background)
+        .on_mouse_down("left", stop).child(Textarea.new(this.draft).w_full()))
+      .child(h_flex().gap(8).items_center().justify_end()
+        .child(this.button(t, "c-cancel", tr.cancel, (cx) => this.discardDraft(cx)))
+        .child(this.button(t, "c-send", this.sending ? tr.commentSending : m.mode === "edit" ? tr.save : tr.commentSend, (cx) => this.sendComment(cx), !empty && !this.sending)));
   }
 
   copy(text, what, cx) { cx.write_to_clipboard(text); this.say(T().copied(what, text), cx, "success"); }
@@ -969,6 +1213,14 @@ export default class Linear extends View {
       else if (k === "escape") { this.closeComposer(cx); cx.stop_propagation(); }
       return;
     }
+    if (this.labelPick) {
+      // The label filter has the keys, apart from moving through the list and leaving.
+      if (k === "escape") this.closeLabels(cx);
+      else if (k === "down" || k === "ctrl-n") { this.labelPick.sel++; cx.notify(); }
+      else if (k === "up" || k === "ctrl-p") { this.labelPick.sel = Math.max(0, this.labelPick.sel - 1); cx.notify(); }
+      else return;
+      cx.stop_propagation(); return;
+    }
     if (this.lightbox) { this.lightboxKey(k, cx); cx.stop_propagation(); return; }
     if (this.pick) { if (this.pickKey(k, cx)) cx.stop_propagation(); return; }
     if (this.mode === "detail") {
@@ -979,7 +1231,13 @@ export default class Linear extends View {
         i: () => issue && this.copy(issue.identifier, "ID", cx), c: () => issue && this.work(issue, cx),
         r: () => id && this.loadDetail(cx, id, true),
         g: () => { const l = id && this.tabLinks()[id]; l ? this.goTab(l) : this.say(T().noTab, cx); },
-        tab: () => { this.section = this.section === "body" ? "comments" : "body"; cx.notify(); },
+        tab: () => id && this.toggleComments(id, cx),
+        down: () => id && this.scrollBy(id, 60, cx), up: () => id && this.scrollBy(id, -60, cx),
+        pagedown: () => id && this.scrollBy(id, this.scrollOf(id).view * 0.85, cx), pageup: () => id && this.scrollBy(id, -this.scrollOf(id).view * 0.85, cx),
+        space: () => id && this.scrollBy(id, this.scrollOf(id).view * 0.85, cx), "shift-space": () => id && this.scrollBy(id, -this.scrollOf(id).view * 0.85, cx),
+        home: () => id && this.jump(id, "top", cx), end: () => id && this.jump(id, "end", cx),
+        "]": () => id && this.stepOutline(id, 1, cx), "[": () => id && this.stepOutline(id, -1, cx),
+        l: () => id && this.openLabels(id, cx),
         m: () => id && this.openComposer(id, cx),
         "ctrl-l": () => this.setLayout(this.layout === "split" ? "list" : "split", cx),
         v: () => { const g = this.gallery(); g.length ? this.openLightbox(g[0], cx) : this.say(T().noImage, cx); },
@@ -1130,7 +1388,7 @@ export default class Linear extends View {
       .on_mouse_down("left", stop)
       .on_click((e, cx) => {
         if (on || e.click_count === 2) this.activate(r, cx);
-        else { this.sel = index; this.section = "body"; this.schedulePreview(cx); cx.notify(); }
+        else { this.sel = index; this.schedulePreview(cx); cx.notify(); }
       });
     if (r.kind === "deep") return base("l-deep").mt(4).text_color(t.muted).child(T().deepRow);
     if (r.kind === "more") return base("l-more").mt(4).text_color(t.muted).child(this.loading.has("all") ? T().loading : T().more);
@@ -1382,6 +1640,153 @@ export default class Linear extends View {
       .on_mouse_down("left", stop).on_click((_e, cx) => action(cx)).child(label);
   }
 
+  // A small text button on a comment's header line.
+  miniButton(t, id, label, action, on = false) {
+    return h_flex().id(id).h(22).px(7).items_center().rounded(6).text_size(11.5).flex_none()
+      .text_color(on ? t.foreground : t.dim).when(on, (el) => el.bg(t.hover))
+      .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .on_mouse_down("left", stop).on_click((_e, cx) => action(cx)).child(label);
+  }
+
+  // Reaction pills (mine outlined; a click adds or takes back mine) and, when open, the quick picker.
+  reactionsBar(t, id, commentId, data, key) {
+    const me = this.viewer?.id;
+    const groups = Doc.reactionGroups(data, me);
+    const open = this.reactFor === key;
+    if (!groups.length && !open) return null;
+    const pill = (name, count, mine, pid) => h_flex().id(pid).h(24).px(8).gap(5).items_center().rounded(12).border_1().flex_none()
+      .border_color(mine ? t.accent : t.border).bg(mine ? `${t.accent}26` : t.raised).cursor_pointer()
+      .hover((s) => s.border_color(t.accent)).on_mouse_down("left", stop)
+      .on_click((_e, cx) => this.toggleReaction(id, commentId, name, cx))
+      .child(div().text_size(13).child(Doc.emoji(name)))
+      .when(count > 0, (el) => el.child(div().text_size(11.5).text_color(mine ? t.foreground : t.muted).child(String(count))));
+    const have = new Set(groups.map((g) => g.emoji));
+    return h_flex().gap(6).flex_wrap().items_center()
+      .children(groups.map((g) => pill(g.emoji, g.count, Boolean(g.mine), `${key}-r-${g.emoji}`)))
+      .when(open, (el) => el.child(h_flex().gap(2).p(2).rounded(14).border_1().border_color(t.border).bg(t.surface)
+        .children(Doc.QUICK.filter((e) => !have.has(e)).map((e) => h_flex().id(`${key}-q-${e}`).size(26).items_center().justify_center()
+          .rounded(13).text_size(14).cursor_pointer().hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+          .on_click((_e, cx) => this.toggleReaction(id, commentId, e, cx)).child(Doc.emoji(e))))));
+  }
+
+  avatar(t, name, size = 20) {
+    return h_flex().size(size).flex_none().rounded(size / 2).bg(t.raised).items_center().justify_center()
+      .text_size(size * 0.52).font_semibold().text_color(t.muted).child([...(name || "?")][0].toUpperCase());
+  }
+
+  commentView(t, id, c, maxW, reply) {
+    const tr = T();
+    const name = c.user?.displayName ?? c.user?.name ?? tr.unknownUser;
+    const mine = Boolean(this.viewer?.id) && c.user?.id === this.viewer.id;
+    const rkey = `c-${c.id}`;
+    const bar = this.reactionsBar(t, id, c.id, c.reactionData, rkey);
+    return v_flex().gap(6).min_w(0)
+      .child(h_flex().gap(8).items_center().text_size(11.5)
+        .child(this.avatar(t, name, reply ? 18 : 20))
+        .child(div().font_semibold().flex_none().child(name))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(ago(c.createdAt) + (c.editedAt ? tr.edited : "")))
+        .child(this.miniButton(t, `${rkey}-react`, "☺ +", (cx) => { this.reactFor = this.reactFor === rkey ? null : rkey; cx.notify(); }, this.reactFor === rkey))
+        .when(!reply, (el) => el.child(this.miniButton(t, `${rkey}-reply`, tr.reply, (cx) => this.openComposer(id, cx, { mode: "reply", parentId: c.id, who: name }))))
+        .when(mine, (el) => el.child(this.miniButton(t, `${rkey}-edit`, tr.edit, (cx) => this.openComposer(id, cx, { mode: "edit", commentId: c.id, body: c.body ?? "" })))))
+      .child(this.markdown(t, rkey, c.body ?? "", maxW))
+      .when(Boolean(bar), (el) => el.child(bar));
+  }
+
+  // A comment and its replies in one card; the replies hang off a line on the left.
+  threadView(t, id, th, maxW) {
+    const target = this.draftFor === id && this.draftMode.mode === "reply" && this.draftMode.parentId === th.comment.id;
+    return v_flex().gap(12).p(12).rounded(8).bg(t.surface).border_1().border_color(target ? t.accent : t.border).min_w(0)
+      .child(this.commentView(t, id, th.comment, maxW - 26, false))
+      .when(th.replies.length > 0, (el) => el.child(v_flex().gap(12).ml(9).pl(14).border_l(2).border_color(t.border)
+        .children(th.replies.map((r) => this.commentView(t, id, r, maxW - 26 - 25, true)))));
+  }
+
+  labelsRow(t, id, issue) {
+    const tr = T();
+    const open = this.labelPick?.id === id;
+    return h_flex().gap(6).flex_wrap().items_center()
+      .children((issue.labels?.nodes ?? []).map((l) => this.chip(t, l.color, l.name)))
+      .child(h_flex().id(`lbl-add-${id}`).h(22).px(8).items_center().rounded(11).border_1().border_color(open ? t.accent : t.border)
+        .text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground).bg(t.hover))
+        .on_mouse_down("left", stop).on_click((_e, cx) => (open ? this.closeLabels(cx) : this.openLabels(id, cx)))
+        .child(tr.addLabel));
+  }
+
+  labelPicker(t, issue) {
+    const tr = T();
+    const list = this.labelChoices(issue);
+    const sel = Math.min(this.labelPick.sel, Math.max(0, list.length - 1));
+    const loading = !this.labels[issue.team?.id];
+    const row = (c, n) => {
+      const on = n === sel;
+      const base = h_flex().id(`lbl-${n}`).h(28).px(8).gap(8).items_center().rounded(6).flex_none().cursor_pointer().text_size(12.5)
+        .when(on, (el) => el.bg(t.hover)).hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+        .on_click((_e, cx) => this.pickLabel(cx, c));
+      if (c.kind === "create") return base.child(div().w(14).text_color(t.accent).child("+")).child(div().flex_1().min_w(0).truncate().child(tr.newLabel(c.name)));
+      return base
+        .child(div().w(14).flex_none().text_size(12).text_color(t.accent).child(c.on ? "✓" : ""))
+        .child(div().size(8).flex_none().rounded(4).bg(c.label.color ?? t.dim))
+        .child(div().flex_1().min_w(0).truncate().text_color(c.on ? t.foreground : t.muted).child(this.labelName(c.label)));
+    };
+    return v_flex().gap(6).p(8).w(340).max_w_full().rounded(8).border_1().border_color(t.border).bg(t.surface)
+      .child(h_flex().h(30).px(8).gap(8).items_center().rounded(6).border_1().border_color(t.input).bg(t.background).on_mouse_down("left", stop)
+        .child(Input.new(this.labelInput).flex_1().h_full().text_size(12.5))
+        .when(!this.labelInput.value(), (el) => el.child(div().flex_none().text_size(11.5).text_color(t.dim).child(tr.labelSearch))))
+      .child(v_flex().id("lbl-list").max_h(28 * 8).overflow_y_scrollbar()
+        .when(loading, (el) => el.child(div().p(8).text_size(12).text_color(t.dim).child(tr.loading)))
+        .when(!loading && !list.length, (el) => el.child(div().p(8).text_size(12).text_color(t.dim).child(tr.noLabels)))
+        .children(list.map(row)))
+      .child(div().text_size(11).text_color(t.dim).child(tr.labelHint));
+  }
+
+  // The outline on the right, a map of the page: the description's headings, then each comment
+  // thread. The item at the top of the view is marked, the ones on screen are brighter, and it keeps
+  // the marked one in sight as the page scrolls. A click scrolls the page there.
+  outlineView(t, id, secs, thr, S, onScreen, w) {
+    const tr = T();
+    const heads = secs.filter((s) => s.title);
+    const minL = Math.min(...heads.map((s) => s.level), 3);
+    const ROW = 26, GAP = 1, PAD = 12;
+    const item = (key, el, indent = 0) => {
+      const on = key === S.active, seen = onScreen.has(key);
+      return h_flex().id(`ol-${key}`).h(ROW).flex_none().pl(8 + indent).pr(8).gap(6).items_center().rounded(6).min_w(0)
+        .text_size(12).text_color(on || seen ? t.foreground : t.dim).cursor_pointer()
+        .border_r(2).border_color(on ? t.accent : seen ? t.border : "#00000000").when(on, (e) => e.bg(t.hover).font_semibold())
+        .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_mouse_down("left", stop)
+        .on_click((_e, cx) => this.jump(id, key, cx)).child(el);
+    };
+    const group = (key, label, count) => item(key, h_flex().flex_1().min_w(0).gap(6).items_center()
+      .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold().text_color(t.dim).child(label))
+      .when(count !== undefined, (e) => e.child(div().text_size(11).text_color(t.dim).child(String(count)))));
+    const short = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : `${d.getMonth() + 1}/${d.getDate()}`; };
+    const rows = [group("top", tr.body), ...heads.map((s) => item(s.key, div().flex_1().min_w(0).truncate().child(s.title), (s.level - minL) * 12))];
+    if (thr) {
+      rows.push(group("cmts", tr.commentsTitle, thr.reduce((n, x) => n + 1 + x.replies.length, 0)));
+      for (const x of thr) {
+        const c = x.comment, name = c.user?.displayName ?? c.user?.name ?? tr.unknownUser;
+        rows.push(item(`c:${c.id}`, h_flex().flex_1().min_w(0).gap(6).items_center()
+          .child(this.avatar(t, name, 16))
+          .child(div().flex_1().min_w(0).truncate().child(name))
+          .when(x.replies.length > 0, (e) => e.child(div().flex_none().text_size(10.5).text_color(t.dim).child(`↳${x.replies.length}`)))
+          .child(div().flex_none().text_size(10.5).text_color(t.dim).child(short(c.createdAt)))));
+      }
+    }
+    // Follow: when the marked item changes, bring its row into the middle third.
+    const total = PAD * 2 + rows.length * (ROW + GAP);
+    const olMax = Math.max(0, total - S.olView);
+    const ai = S.keys.indexOf(S.active);
+    if (S.olFollow !== S.active && ai >= 0 && S.olView > 0) {
+      const top = PAD + ai * (ROW + GAP);
+      if (top < S.ol + S.olView / 3 || top + ROW > S.ol + (S.olView * 2) / 3) S.ol = top - S.olView / 3;
+      S.olFollow = S.active;
+    }
+    S.ol = Math.max(0, Math.min(olMax, S.ol));
+    return v_flex().id(`ol-${id}`).w(w).flex_none().h_full().min_h(0).overflow_hidden().border_l(1).border_color(t.border)
+      .on_size_change((size, cx) => { if (Math.abs(size.height - S.olView) > 0.5) { S.olView = size.height; cx.notify(); } })
+      .on_scroll_wheel((e, cx) => { cx.stop_propagation(); const y = Math.max(0, Math.min(olMax, S.ol - e.delta.y)); if (y !== S.ol) { S.ol = y; cx.notify(); } })
+      .child(v_flex().flex_none().w_full().mt(-S.ol).py(PAD).px(8).gap(GAP).children(rows));
+  }
+
   detailView(t, id, full) {
     const tr = T();
     const d = this.details[id];
@@ -1398,7 +1803,12 @@ export default class Linear extends View {
 
     const rel = d?.relations;
     const link = this.links?.[issue.identifier];
-    const maxW = Math.max(160, (full || this.width < WIDE ? this.width : this.width - this.listW) - 40);
+    const paneW = full || this.width < WIDE ? this.width : this.width - this.listW;
+    const secs = Doc.sections(issue.description ?? "");
+    const thr = d ? Doc.threads(d.comments) : null;
+    const tocW = 200;
+    const showToc = paneW >= 640 && (secs.some((s) => s.title) || (thr?.length ?? 0) > 0);
+    const maxW = Math.max(160, paneW - 40 - (showToc ? tocW : 0));
     const relRow = (x, n, kind) => h_flex().id(`rel-${kind}-${x.id}-${n}`).h(26).px(8).gap(8).items_center().rounded(6).cursor_pointer()
       .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
       .on_click((_e, cx) => this.openDetail(x.identifier, cx, !full))
@@ -1420,7 +1830,7 @@ export default class Linear extends View {
     ].filter(Boolean);
     const agent = this.agentName();
 
-    const body = v_flex().gap(14).p(16)
+    const head = () => v_flex().gap(14)
       .child(h_flex().gap(8).items_center().flex_wrap()
         .when(full, (el) => el.child(this.button(t, "d-back", tr.back, (cx) => this.back(cx))))
         .child(div().id("d-ident").text_size(12).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
@@ -1432,7 +1842,8 @@ export default class Linear extends View {
         .child(div().text_size(11.5).text_color(t.dim).child(issue.team?.name ?? "")))
       .child(TextView.markdown(`d-title-${id}`, `## ${issue.title.replace(/[\\`*_[\]#]/g, "\\$&")}`).selectable())
       .child(div().text_size(11.5).text_color(t.muted).child(meta))
-      .when((issue.labels?.nodes ?? []).length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().children(issue.labels.nodes.map((l) => this.chip(t, l.color, l.name)))))
+      .child(this.labelsRow(t, id, issue))
+      .when(this.labelPick?.id === id, (el) => el.child(this.labelPicker(t, issue)))
       .when(Boolean(link), (el) => el.child(h_flex().gap(10).p(10).items_center().rounded(8).bg(t.surface).border_1().border_color(t.border)
         .child(this.agentBadge(t, link, `db-${id}`, true))
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(tr.tabIn(link.space.name, link.tab.name)))
@@ -1445,37 +1856,76 @@ export default class Linear extends View {
         .when(Boolean(pr), (el) => el.child(this.prBadge(t, pr, "d-pr", true))))
       .when(groups.length > 0, (el) => el.child(v_flex().gap(10).p(10).rounded(8).bg(t.surface).border_1().border_color(t.border).children(groups)));
 
-    const nComments = d ? `${d.comments.length}${d.moreComments ? "+" : ""}` : "…";
-    const seg = (key, label) => {
-      const on = this.section === key;
-      return h_flex().id(`seg-${key}`).h(30).px(4).mr(14).items_center().text_size(12.5).cursor_pointer()
-        .border_b(2).border_color(on ? t.foreground : t.popover).text_color(on ? t.foreground : t.muted)
-        .when(on, (el) => el.font_semibold()).hover((s) => s.text_color(t.foreground))
-        .on_mouse_down("left", stop).on_click((_e, cx) => { this.section = key; cx.notify(); }).child(label);
-    };
-    body.child(h_flex().items_end().border_b(1).border_color(t.border)
-      .child(seg("body", tr.body)).child(seg("comments", tr.comments(nComments))));
+    const divider = (label) => h_flex().gap(10).items_center().pt(6).text_size(11.5).font_semibold().text_color(t.dim)
+      .child(div().child(label)).child(div().flex_1().h(1).bg(t.border));
 
-    if (this.section === "body") {
-      body.child(issue.description?.trim()
-        ? this.markdown(t, `d-body-${id}`, issue.description, maxW)
-        : div().text_size(12).text_color(t.dim).child(tr.noBody));
-    } else if (!d) {
-      body.child(div().text_size(12).text_color(t.dim).child(tr.commentsLoading));
-    } else if (!d.comments.length) {
-      body.child(div().text_size(12).text_color(t.dim).child(tr.noComments));
-    } else {
-      body.children(d.comments.map((c) => v_flex().gap(6).p(12).rounded(8).bg(t.surface).border_1().border_color(t.border)
-        .child(h_flex().gap(8).items_center().text_size(11.5)
-          .child(h_flex().size(20).flex_none().rounded(10).bg(t.raised).items_center().justify_center().text_size(10.5).font_semibold().text_color(t.muted)
-            .child([...(c.user?.displayName ?? c.user?.name ?? "?")][0].toUpperCase()))
-          .child(div().font_semibold().child(c.user?.displayName ?? c.user?.name ?? tr.unknownUser))
-          .child(div().text_color(t.dim).child(ago(c.createdAt) + (c.editedAt ? tr.edited : ""))))
-        .child(this.markdown(t, `c-${c.id}`, c.body ?? "", maxW - 26))));
-      if (d.moreComments) body.child(div().text_size(11.5).text_color(t.dim).child(tr.moreComments));
+    // The view's items, in order. The outline points at them by key.
+    const items = [{ key: "top", el: () => v_flex().gap(14).child(head()).child(divider(tr.body)) }];
+    if (!secs.length) items.push({ key: "nobody", el: () => div().text_size(12).text_color(t.dim).child(tr.noBody) });
+    for (const s of secs) items.push({ key: s.key, el: () => this.markdown(t, `d-body-${id}-${s.key}`, s.text, maxW) });
+    if (d) {
+      const bar = this.reactionsBar(t, id, null, d.issue.reactionData, "issue");
+      items.push({ key: "ireact", el: () => h_flex().gap(6).items_center().flex_wrap()
+        .when(Boolean(bar), (el) => el.child(bar))
+        .when(this.reactFor !== "issue", (el) => el.child(this.miniButton(t, "issue-react", "☺ +", (cx) => { this.reactFor = "issue"; cx.notify(); }))) });
     }
-    if (this.section === "comments" && d) body.child(this.composerView(t, id));
-    return v_flex().id(`d-scroll-${id}`).flex_1().w_full().min_h(0).overflow_y_scrollbar().on_mouse_down("left", stop).child(body);
+    if (!d) items.push({ key: "cloading", el: () => div().text_size(12).text_color(t.dim).child(tr.commentsLoading) });
+    else {
+      const n = `${d.comments.length}${d.moreComments ? "+" : ""}`;
+      items.push({ key: "cmts", el: () => v_flex().gap(10).child(divider(tr.comments(n)))
+        .when(!thr.length, (el) => el.child(div().text_size(12).text_color(t.dim).child(tr.noComments))) });
+      for (const th of thr) items.push({ key: `c:${th.comment.id}`, el: () => this.threadView(t, id, th, maxW) });
+      if (d.moreComments) items.push({ key: "cmore", el: () => div().text_size(11.5).text_color(t.dim).child(tr.moreComments) });
+    }
+
+    // Where each item is (from the heights measured last frame), which outline item is at the top,
+    // and which are on screen.
+    const S = this.scrollOf(id);
+    const GAP = 14, PAD = 16;
+    let y = PAD;
+    for (const i of items) { S.tops[i.key] = y; y += (S.h[i.key] ?? 0) + GAP; }
+    S.y = Math.max(0, Math.min(this.maxScroll(S), S.y));
+    S.keys = ["top", ...secs.filter((s) => s.title).map((s) => s.key), ...(thr ? ["cmts", ...thr.map((x) => `c:${x.comment.id}`)] : [])];
+    const reach = S.y + 24;
+    S.active = S.keys.reduce((a, k) => ((S.tops[k] ?? Infinity) <= reach ? k : a), "top");
+    // At the very bottom the last items can't reach the top; mark the last one that's on screen.
+    const onScreen = new Set();
+    const order = items.map((i) => i.key);
+    for (let n = 0; n < order.length; n++) {
+      const top = S.tops[order[n]], bottom = top + (S.h[order[n]] ?? 0);
+      if (bottom >= S.y && top <= S.y + S.view) onScreen.add(order[n]);
+    }
+    // Items between two outline keys belong to the one before (a section's text to its heading).
+    const owner = {};
+    let cur = "top";
+    for (const k of order) { if (S.keys.includes(k)) cur = k; owner[k] = cur; }
+    const seen = new Set([...onScreen].map((k) => owner[k]));
+    if (S.view > 0 && S.y >= this.maxScroll(S) - 2 && S.y > 0) {
+      const last = S.keys.filter((k) => seen.has(k)).pop();
+      if (last) S.active = last;
+    }
+
+    const thumb = S.content > S.view && S.view > 0
+      ? (() => {
+        const h = Math.max(24, (S.view * S.view) / S.content);
+        const top = (S.y / Math.max(1, this.maxScroll(S))) * (S.view - h);
+        return div().absolute().top(top).right(2).w(5).h(h).rounded(3).bg(t.border);
+      })()
+      : null;
+    const page = v_flex().id(`d-view-${id}`).relative().flex_1().min_w(0).h_full().min_h(0).overflow_hidden()
+      .on_size_change((size, cx) => { if (Math.abs(size.height - S.view) > 0.5) { S.view = size.height; cx.notify(); } })
+      .on_scroll_wheel((e, cx) => this.scrollBy(id, -e.delta.y, cx))
+      .child(v_flex().id(`d-content-${id}`).flex_none().w_full().mt(-S.y).gap(GAP).p(PAD).pb(40)
+        .on_size_change((size, cx) => { if (Math.abs(size.height - S.content) > 0.5) { S.content = size.height; cx.notify(); } })
+        .children(items.map((i) => v_flex().id(`d-item-${i.key}`).flex_none().w_full()
+          .on_size_change((size, cx) => { if (this.measured(S.h, i.key, size.height)) cx.notify(); })
+          .child(i.el()))))
+      .when(Boolean(thumb), (el) => el.child(thumb));
+    return v_flex().flex_1().w_full().min_h(0).on_mouse_down("left", stop)
+      .child(h_flex().flex_1().w_full().min_h(0).items_start()
+        .child(page)
+        .when(showToc, (el) => el.child(this.outlineView(t, id, secs, thr, S, seen, tocW))))
+      .when(Boolean(d), (el) => el.child(this.composerView(t, id)));
   }
 
   footer(t) {
