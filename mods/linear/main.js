@@ -15,6 +15,7 @@ import { Store } from "./store.js";
 import { T, setLanguage } from "./i18n.js";
 import { demo } from "./demo.js";
 import { Places } from "./places.js";
+import { stateIcon } from "./states.js";
 
 const BASE = "mods/linear";
 const ICON = `${BASE}/icons`;
@@ -34,12 +35,6 @@ const IDENT_IN_NAME = /[A-Za-z][A-Za-z0-9]*-\d+/g;
 const TREE_STEP = 22, TREE_X = 7; // a sub-issue level's indent, and where its line runs (under the parent's priority icon)
 const CLOSED = new Set(["completed", "canceled", "duplicate"]);
 
-function stateIcon(state) {
-  const type = state?.type;
-  if (type === "started" && /review|리뷰/i.test(state?.name ?? "")) return `${ICON}/state-review.svg`;
-  const known = ["backlog", "triage", "unstarted", "started", "completed", "canceled"];
-  return `${ICON}/state-${known.includes(type) ? type : type === "duplicate" ? "canceled" : "unstarted"}.svg`;
-}
 
 // "42s", "7m 05s", "1h 12m".
 function elapsed(ms) {
