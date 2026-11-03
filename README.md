@@ -8,7 +8,7 @@ A native port of [herdr-linear](https://github.com/jenthous/herdr-linear), the t
 
 ## Features
 
-- **Three lists.** My open issues, recently opened, and all issues of every team your API key belongs to (no team setup).
+- **Views and saved filters in one row.** Under the search: All (every team your API key belongs to, the default), My issues (open, assigned to you), Recent (opened here), then your saved searches. Tab/⇧Tab steps through the three views.
 - **Search as you type.** Loaded issues filter at once; after a 0.3 s pause the server is asked too. Mix free text with tokens: `s:started`, `l:bug`, `@me`, `#ENG`, `p:urgent`, or an identifier like `ENG-142`. The last row searches comments as well.
 - **Filter and Display.** Two buttons beside the search, as in Linear. Filter lists Status, Assignee, Priority, Labels and Team; pick values ("is" or "is not") and they're written into the search as tokens (`s:"In Review" -l:bug`), so you can see and edit them; typing in the menu finds values across fields. Display sets the ordering (Default, Updated, Created, Priority, Status; ↓/↑ reverses), hides completed issues, and turns sub-issue nesting on or off. A dot on a button means something is set. Sorting applies to the loaded issues; All loads newest-updated pages first.
 - **Linear's look.** State icons (backlog, todo, in progress, in review, done, canceled) in each state's color, and priority bars with the urgent mark.
@@ -23,6 +23,10 @@ A native port of [herdr-linear](https://github.com/jenthous/herdr-linear), the t
 - **Fast reopen.** Everything fetched is cached, so the window shows your lists instantly, refreshes them (and the shown issue) as it opens and again every 60 s. The cache keeps what was used in the last 30 days (`cacheDays`): older issue details and images are deleted as the window opens.
 
 ![An issue with the label picker open, its pull request, relations, the agent working on it and the outline on the right](docs/detail.png)
+
+## Optional: sidebar chips
+
+If you name spaces after issues, `extras/sidebar-chips` can show each issue's state in the spaces sidebar. It takes a copy of the sidebar mod and a few lines of code; the guide is there. Not needed for the Linear window.
 
 ## Install
 

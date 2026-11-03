@@ -31,7 +31,7 @@ const PR_COLOR = { open: "#3fb950", draft: null, merged: "#a371f7", closed: "#f8
 const PR_ICON = { open: "pr", draft: "pr", merged: "pr-merged", closed: "pr-closed" };
 const REVIEW_COLOR = { approved: "#3fb950", changes: "#d29922" };
 const PRIO_ICON = { 0: "prio-none", 1: "prio-urgent", 2: "prio-3", 3: "prio-2", 4: "prio-1" };
-const TAB_IDS = ["mine", "recent", "all"];
+const TAB_IDS = ["all", "mine", "recent"];
 const IDENT_IN_NAME = /[A-Za-z][A-Za-z0-9]*-\d+/g;
 const TREE_STEP = 22, TREE_X = 7; // a sub-issue level's indent, and where its line runs (under the parent's priority icon)
 const CLOSED = new Set(["completed", "canceled", "duplicate"]);
@@ -88,7 +88,7 @@ export default class Linear extends View {
     this.server = []; // server filter search results
     this.deep = []; // deep (comment) search results
     this.deepFor = null;
-    this.tab = "mine";
+    this.tab = "all";
     this.query = "";
     this.sel = 0;
     this.mode = "list"; // list | detail
@@ -164,7 +164,7 @@ export default class Linear extends View {
       this.all = load("all", []);
       this.cache = load("cache", {});
       this.recent = load("recent", []);
-      this.tab = load("tab", "mine");
+      this.tab = load("tab", "all");
       this.details = load("details", {});
       this.listW = load("listW", LIST_W);
       this.layout = load("layout", "split");
@@ -1358,18 +1358,10 @@ export default class Linear extends View {
 
   header(t) {
     const busy = this.loading.size > 0;
-    const count = { mine: this.mine.length, recent: this.recent.length, all: this.all.length };
     return h_flex().h(42).flex_none().px(14).gap(10).items_center().border_b(1).border_color(t.border)
       .child(div().text_size(14).font_semibold().child("Linear"))
       .child(div().text_size(11.5).text_color(t.dim).child(this.viewer?.organization?.name ?? ""))
       .when(DEMO, (el) => el.child(div().text_size(11).px(6).rounded(4).border_1().border_color(t.border).text_color(t.dim).child(T().demo)))
-      .child(h_flex().ml(8).gap(2).children(TAB_IDS.map((id) => {
-        const on = this.mode === "list" && !this.query && this.tab === id;
-        return h_flex().id(`lt-${id}`).h(26).px(9).gap(5).items_center().rounded(6).text_size(12)
-          .bg(on ? t.selected : t.popover).text_color(on ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
-          .on_mouse_down("left", stop).on_click((_e, cx) => { if (this.mode === "detail") { this.stack = []; this.mode = "list"; this.input.focus(); } this.setTab(id, cx); })
-          .child(T().tabs[id]).child(div().text_size(10.5).text_color(t.dim).child(String(count[id] ?? "")));
-      })))
       .child(div().flex_1())
       .when(busy, (el) => el.child(svg(`${ICON}/spinner.svg`).size(13).text_color(t.dim).spin(900)))
       .when(this.width >= WIDE, (el) => el.child(this.layoutSwitch(t)))
@@ -1405,7 +1397,7 @@ export default class Linear extends View {
         .when(!this.query, (el) => el.child(div().flex_none().text_size(12).text_color(t.dim).child(T().searchPlaceholder))))
         .child(this.popButton(t, "filter", `${ICON}/filter.svg`, T().filter, Q.parse(this.query).conds.length > 0))
         .child(this.popButton(t, "display", `${ICON}/sliders.svg`, T().display, this.sort.by !== "default" || this.sort.asc || this.hideClosed || !this.nest)))
-      .when(this.filters.length > 0 || Boolean(this.query.trim()), (el) => el.child(this.filterBar(t)));
+      .child(this.filterBar(t));
   }
 
   // ── Filter and display popovers ───────────────────────
@@ -1585,7 +1577,18 @@ export default class Linear extends View {
     const active = this.savedIndex(this.query);
     const pill = (id) => h_flex().id(id).h(24).px(9).gap(6).items_center().rounded(12).border_1().text_size(11.5).cursor_pointer()
       .on_mouse_down("left", stop);
+    // The built-in views first (All, My issues, Recent: lists of their own, not searches), then saved searches.
+    const count = { mine: this.mine.length, recent: this.recent.length, all: this.all.length };
+    const views = TAB_IDS.map((id) => {
+      const on = !this.query.trim() && this.tab === id;
+      return pill(`lt-${id}`).border_color(on ? t.accent : t.border).bg(on ? t.selected : t.popover)
+        .text_color(on ? t.foreground : t.muted).hover((s) => s.bg(on ? t.selected : t.hover).text_color(t.foreground))
+        .on_click((_e, cx) => { this.setTab(id, cx); this.input.focus(); })
+        .child(tr.tabs[id]).child(div().text_size(10.5).text_color(t.dim).child(String(count[id] ?? "")));
+    });
     return h_flex().gap(6).flex_wrap().items_center()
+      .children(views)
+      .when(this.filters.length > 0, (el) => el.child(div().w(1).h(16).mx(2).bg(t.border)))
       .children(this.filters.map((f, n) => {
         const on = n === active;
         return pill(`lf-${n}`).border_color(on ? t.accent : t.border).bg(on ? t.selected : t.popover)
