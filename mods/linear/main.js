@@ -113,6 +113,8 @@ export default class Linear extends View {
     this.popField = null; // the filter menu's open field (state, assignee, …)
     this.popNeg = false; // the filter menu adds "is not" values
     this.popMenu = null; // the display panel's open choice (order, closed)
+    this.confirmDel = null; // the preset whose delete waits for a second press
+    this.renaming = null; // the preset being renamed
     this.collapsed = new Set(); // parents whose sub-issues are folded in the list
     this.dataVer = 0; this.foldVer = 0; // bumped when cached issues or folds change (rows() is memoized on them)
     this.height = 700;
@@ -145,6 +147,10 @@ export default class Linear extends View {
     this.labelInput = InputState.new({ placeholder: "" });
     this.labelInput.on("change", (_e, cx) => { if (this.labelPick) this.labelPick.sel = 0; cx.notify(); });
     this.labelInput.on("submit", (_e, cx) => this.pickLabel(cx));
+
+    this.renameInput = InputState.new({ placeholder: "" });
+    this.renameInput.on("submit", (_e, cx) => this.finishRename(cx, true));
+    this.renameInput.on("blur", (_e, cx) => { if (this.renaming !== null) this.finishRename(cx, true); });
 
     this.popInput = InputState.new({ placeholder: "" });
     this.popInput.on("change", (_e, cx) => cx.notify());
@@ -196,7 +202,7 @@ export default class Linear extends View {
     // Redraw once a second only while an issue tab has a working agent (the elapsed time).
     cx.timer.every(1000, (cx) => {
       this.watchAgents(cx);
-      if (DEMO || spaces().some((s) => s.tabs.some((tb) => tb.working_since && tb.name.match(IDENT_IN_NAME)))) cx.notify();
+      if (DEMO || spaces().some((s) => s.tabs.some((tb) => tb.working_since && tb.name.match(IDENT_IN_NAME)))) this.redraw(cx);
     });
     cx.timer.after(400, () => (this.needKey ? this.keyInput : this.input).focus());
     // From keys.json or `herdr-app do`: linear.search[:text], linear.refresh, linear.demo, linear.close, linear.layout[:split|list], linear.open:ENG-123
@@ -290,7 +296,7 @@ export default class Linear extends View {
   }
 
   async call(cx, label, fn) {
-    this.loading.add(label); cx.notify();
+    this.loading.add(label); this.redraw(cx);
     try {
       const r = await fn();
       if (this.status?.level === "error") this.status = null;
@@ -300,8 +306,22 @@ export default class Linear extends View {
       if (e?.kind === "auth") { this.needKey = true; this.keyInput.focus(); }
       return undefined;
     } finally {
-      this.loading.delete(label); cx.notify();
+      this.loading.delete(label); this.redraw(cx);
     }
+  }
+
+  // Background redraws wait while the left button is held on the detail: a redraw in the middle of a
+  // drag can drop the text selection. The release (or a 10 s safety) draws what was held.
+  redraw(cx) { if (this.holding) this.heldDraw = true; else cx.notify(); }
+  hold(cx) {
+    this.holding = true;
+    const gen = (this.holdGen = (this.holdGen ?? 0) + 1);
+    cx.timer.after(10000, (cx) => { if (gen === this.holdGen) this.release(cx); });
+  }
+  release(cx) {
+    if (!this.holding) return;
+    this.holding = false;
+    if (this.heldDraw) { this.heldDraw = false; cx.notify(); }
   }
 
   teamIds() { return (this.viewer?.teams?.nodes ?? []).map((t) => t.id); }
@@ -332,7 +352,7 @@ export default class Linear extends View {
     const shown = this.shownId();
     if (shown) this.loadDetail(cx, shown, true);
     if (this.query) this.searchServer(cx, this.query);
-    cx.notify();
+    this.redraw(cx);
   }
 
   async moreAll(cx) {
@@ -374,7 +394,7 @@ export default class Linear extends View {
     const urls = [...imageUrls(d.issue.description), ...d.comments.flatMap((c) => imageUrls(c.body))];
     for (const url of urls) {
       if (this.images.get(url)) continue;
-      cx.spawn(async (cx) => { await this.images.load(url, this.key); cx.notify(); });
+      cx.spawn(async (cx) => { await this.images.load(url, this.key); this.redraw(cx); });
     }
   }
 
@@ -684,15 +704,84 @@ export default class Linear extends View {
   // A saved filter is a search (words and tokens). ⌃S saves the current one (or removes it if saved),
   // a pill or ⌃1–9 runs one, running the active one again clears the search.
 
-  savedIndex(query) { const q = query.trim(); return this.filters.findIndex((f) => f.query === q); }
+  // A preset is a search and, when it was saved with one, a display (order, closed issues hidden):
+  // { query, sort?, hideClosed? }. It's the active one when the window shows exactly that.
+  displayIsDefault() { return this.sort.by === "default" && !this.sort.asc && !this.hideClosed; }
 
+  presetMatches(f) {
+    if (f.query !== this.query.trim()) return false;
+    if (!f.query && f.tab && f.tab !== this.tab) return false;
+    if (!f.sort) return f.query !== "" || this.displayIsDefault();
+    return f.sort.by === this.sort.by && Boolean(f.sort.asc) === this.sort.asc && Boolean(f.hideClosed) === this.hideClosed;
+  }
+
+  savedIndex() {
+    // A preset with a display beats one with the same search alone.
+    const n = this.filters.findIndex((f) => f.sort && this.presetMatches(f));
+    return n >= 0 ? n : this.filters.findIndex((f) => !f.sort && this.presetMatches(f));
+  }
+
+  canSave() { return Boolean(this.query.trim()) || !this.displayIsDefault(); }
+
+  presetLabel(f) {
+    const tr = T();
+    if (f.name) return f.name;
+    const parts = [f.query || tr.tabs[f.tab ?? "all"]];
+    if (f.sort && f.sort.by !== "default") parts.push(`${f.sort.asc ? "↑" : "↓"} ${tr.sort[f.sort.by]}`);
+    else if (f.sort?.asc) parts.push("↑");
+    if (f.hideClosed) parts.push(tr.closedHidden);
+    return parts.join(" · ");
+  }
+
+  // ⌃S (or the + pill, or the filter menu): saves what's shown as a preset, or removes the active one.
+  // The display goes in only when it isn't the default, so a search-only preset leaves the order alone.
   toggleSaveFilter(cx) {
-    const q = this.query.trim();
-    if (!q) { this.say(T().filterEmpty, cx); return; }
-    const n = this.savedIndex(q);
-    if (n >= 0) { this.filters = this.filters.filter((_f, k) => k !== n); this.say(T().filterRemoved(q), cx); }
-    else { this.filters = [...this.filters, { query: q }]; this.say(T().filterSaved(q), cx, "success"); }
+    const n = this.savedIndex();
+    if (n >= 0) { this.askDelete(n, cx); return; }
+    else if (!this.canSave()) { this.say(T().filterEmpty, cx); return; }
+    else {
+      const f = { query: this.query.trim() };
+      if (!f.query) f.tab = this.tab; // a display alone applies to a view
+      if (!this.displayIsDefault()) { f.sort = { ...this.sort }; f.hideClosed = this.hideClosed; }
+      this.filters = [...this.filters, f];
+      this.say(T().filterSaved(this.presetLabel(f)), cx, "success");
+    }
     save("filters", this.filters);
+    cx.notify();
+  }
+
+  // Deleting takes a second press within 3 s: the first turns × into "Delete?".
+  askDelete(n, cx) {
+    if (this.confirmDel === n) { this.confirmDel = null; this.removeFilter(n, cx); cx.notify(); return; }
+    this.confirmDel = n;
+    this.say(T().confirmDelete(this.presetLabel(this.filters[n])), cx);
+    cx.timer.after(3000, (cx) => { if (this.confirmDel === n) { this.confirmDel = null; cx.notify(); } });
+    cx.notify();
+  }
+
+  // Rename: ✎ on the active preset turns its pill into a field. Enter or leaving it keeps the name
+  // (empty goes back to the search as the name), Esc cancels.
+  startRename(n, cx) {
+    const f = this.filters[n];
+    if (!f) return;
+    this.renaming = n; this.confirmDel = null;
+    this.renameInput.set_value(f.name ?? "");
+    cx.timer.after(0, () => this.renameInput.focus());
+    cx.notify();
+  }
+
+  finishRename(cx, keep) {
+    const n = this.renaming;
+    if (n === null) return;
+    this.renaming = null;
+    const f = this.filters[n];
+    if (keep && f) {
+      const name = this.renameInput.value().trim();
+      this.filters = this.filters.map((x, k) => (k === n ? (name && name !== x.query ? { ...x, name } : (({ name: _n, ...rest }) => rest)(x)) : x));
+      save("filters", this.filters);
+      this.say(T().presetRenamed(this.presetLabel(this.filters[n])), cx, "success");
+    }
+    if (this.mode === "list") this.input.focus();
     cx.notify();
   }
 
@@ -701,17 +790,32 @@ export default class Linear extends View {
     if (!f) return;
     this.filters = this.filters.filter((_f, k) => k !== n);
     save("filters", this.filters);
-    this.say(T().filterRemoved(f.query), cx);
+    this.say(T().filterRemoved(this.presetLabel(f)), cx);
   }
 
+  // Runs a preset (its display too; what was shown before comes back when it's turned off). Running the
+  // active one again clears it.
   applyFilter(n, cx) {
     const f = this.filters[n];
     if (!f) return;
-    const q = this.query.trim() === f.query ? "" : f.query;
+    const off = this.savedIndex() === n;
     if (this.mode === "detail") { this.stack = []; this.mode = "list"; }
+    if (off) {
+      if (this.displayBefore) { this.sort = this.displayBefore.sort; this.hideClosed = this.displayBefore.hideClosed; this.displayBefore = null; }
+    } else if (f.sort) {
+      this.displayBefore ??= { sort: { ...this.sort }, hideClosed: this.hideClosed };
+      this.sort = { ...f.sort }; this.hideClosed = Boolean(f.hideClosed);
+    } else if (this.displayBefore) {
+      this.sort = this.displayBefore.sort; this.hideClosed = this.displayBefore.hideClosed; this.displayBefore = null;
+    }
+    save("sort", this.sort); save("hideClosed", this.hideClosed);
+    const q = off ? "" : f.query;
+    if (!off && !f.query && f.tab) { this.tab = f.tab; save("tab", f.tab); }
+    this.sel = 0;
     this.input.set_value(q);
     this.onQuery(q, cx);
     this.input.focus();
+    cx.notify();
   }
 
   schedulePreview(cx) {
@@ -1203,7 +1307,11 @@ export default class Linear extends View {
         .child(this.button(t, "c-send", this.sending ? tr.commentSending : m.mode === "edit" ? tr.save : tr.commentSend, (cx) => this.sendComment(cx), !empty && !this.sending)));
   }
 
-  copy(text, what, cx) { cx.write_to_clipboard(text); this.say(T().copied(what, text), cx, "success"); }
+  copy(text, what, cx) {
+    cx.write_to_clipboard(text);
+    const one = text.replace(/\s+/g, " ").trim();
+    this.say(T().copied(what, one.length > 48 ? `${one.slice(0, 48)}…` : one), cx, "success");
+  }
   openUrl(url, cx) { if (/^https?:/.test(url)) cx.open_url(url); }
 
   // Asks where to work, then opens a tab (or a worktree space) named after the issue, running
@@ -1266,7 +1374,12 @@ export default class Linear extends View {
       else if (k === "escape") { this.closeComposer(cx); cx.stop_propagation(); }
       return;
     }
+    if (this.renaming !== null) {
+      if (k === "escape") { this.finishRename(cx, false); cx.stop_propagation(); }
+      return;
+    }
     if (this.pop) {
+      if (k === "ctrl-s") { this.toggleSaveFilter(cx); cx.stop_propagation(); return; }
       if (k === "escape") {
         if (this.popField) { this.popField = null; this.popInput.set_value(""); cx.notify(); } else this.openPop(null, cx);
         cx.stop_propagation();
@@ -1336,7 +1449,8 @@ export default class Linear extends View {
       .on_size_change((size, cx) => {
         if (Math.abs(size.width - this.width) > 1 || Math.abs(size.height - this.height) > 1) { this.width = size.width; this.height = size.height; cx.notify(); }
       })
-      .on_key_down((e, cx) => this.onKey(e, cx));
+      .on_key_down((e, cx) => this.onKey(e, cx))
+      .on_mouse_up("left", (_e, cx) => this.release(cx));
     if (this.needKey) return root.child(this.keyScreen(t));
     this.links = this.tabLinks();
     const wide = this.width >= WIDE;
@@ -1506,7 +1620,7 @@ export default class Linear extends View {
           .child(this.menuRow(t, "pf-clear", false, (cx) => this.setQuery(Q.withoutTokens(this.query), cx))
             .child(div().w(14).flex_none().text_color(t.dim).child("×")).child(div().flex_1().text_color(t.muted).child(tr.clearFilters)));
       }
-      return v_flex().w(280).child(head).child(list);
+      return v_flex().w(280).child(head).child(list).child(this.presetFooter(t));
     }
     const f = this.popField;
     const label = FIELDS.find((x) => x[0] === f)?.[1] ?? "";
@@ -1522,7 +1636,18 @@ export default class Linear extends View {
     const vals = this.filterValues(f).filter((v) => !term || v.label.toLowerCase().includes(term));
     list.children(vals.map((v, n) => this.valueRow(t, f, v, `pv-${n}`)));
     if (!vals.length) list.child(div().p(10).text_size(12).text_color(t.dim).child(tr.noMatch));
-    return v_flex().w(280).child(bar).child(head).child(list);
+    return v_flex().w(280).child(bar).child(head).child(list).child(this.presetFooter(t));
+  }
+
+  // Under both menus: save what's shown as a preset (or that it's saved, with remove).
+  presetFooter(t) {
+    const tr = T(), n = this.savedIndex();
+    if (n < 0 && !this.canSave()) return div();
+    return h_flex().id("pf-save").h(36).px(12).gap(8).items_center().border_t(1).border_color(t.border).text_size(12)
+      .text_color(n >= 0 ? t.muted : t.accent).cursor_pointer().hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+      .on_click((_e, cx) => this.toggleSaveFilter(cx))
+      .child(div().flex_1().child(n >= 0 ? tr.presetSaved : tr.savePreset))
+      .child(div().text_size(10.5).text_color(t.dim).child("⌃S"));
   }
 
   // One value: ✓ when it's in the search with the sign being added (⊘ when it's there as "is not").
@@ -1567,14 +1692,15 @@ export default class Linear extends View {
       .child(row(tr.closedIssues, select("pd-closed", this.hideClosed ? tr.closedHide : tr.closedAll, "closed")))
       .when(Boolean(closedOpts), (el) => el.child(closedOpts))
       .child(row(tr.nestSub, toggle))
-      .child(h_flex().mt(4).px(14).pt(8).border_t(1).border_color(t.border).justify_end()
+      .child(h_flex().mt(4).px(14).pt(8).gap(8).border_t(1).border_color(t.border).justify_end()
+        .when(this.canSave() || this.savedIndex() >= 0, (el) => el.child(this.button(t, "pd-save", this.savedIndex() >= 0 ? tr.presetSaved : tr.savePreset, (cx) => this.toggleSaveFilter(cx), this.savedIndex() < 0)))
         .child(this.button(t, "pd-reset", tr.reset, (cx) => this.resetDisplay(cx))));
   }
 
   // Saved filters as pills; the active one is selected and has × to remove it. "+ Save" for a new search.
   filterBar(t) {
     const tr = T();
-    const active = this.savedIndex(this.query);
+    const active = this.savedIndex();
     const pill = (id) => h_flex().id(id).h(24).px(9).gap(6).items_center().rounded(12).border_1().text_size(11.5).cursor_pointer()
       .on_mouse_down("left", stop);
     // The built-in views first (All, My issues, Recent: lists of their own, not searches), then saved searches.
@@ -1591,15 +1717,27 @@ export default class Linear extends View {
       .when(this.filters.length > 0, (el) => el.child(div().w(1).h(16).mx(2).bg(t.border)))
       .children(this.filters.map((f, n) => {
         const on = n === active;
+        if (this.renaming === n) {
+          return h_flex().id(`lf-r-${n}`).h(24).w(200).px(9).gap(6).items_center().rounded(12).border_1().border_color(t.accent).bg(t.background)
+            .on_mouse_down("left", stop)
+            .child(Input.new(this.renameInput).flex_1().h_full().text_size(11.5))
+            .when(!this.renameInput.value(), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(tr.renameHint)));
+        }
+        const asking = this.confirmDel === n;
+        const icon = (id, label, action, color) => div().id(id).px(3).rounded(4).text_color(color ?? t.dim).hover((s) => s.text_color(t.foreground).bg(t.hover))
+          .on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); action(cx); }).child(label);
         return pill(`lf-${n}`).border_color(on ? t.accent : t.border).bg(on ? t.selected : t.popover)
           .text_color(on ? t.foreground : t.muted).hover((s) => s.bg(on ? t.selected : t.hover).text_color(t.foreground))
           .on_click((_e, cx) => this.applyFilter(n, cx))
           .when(n < 9, (el) => el.child(div().text_size(10.5).text_color(t.dim).child(`⌃${n + 1}`)))
-          .child(div().max_w(220).truncate().child(f.query))
-          .when(on, (el) => el.child(div().id(`lf-x-${n}`).px(2).rounded(4).text_color(t.dim).hover((s) => s.text_color(t.foreground))
-            .on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); this.removeFilter(n, cx); }).child("×")));
+          .when(Boolean(f.sort), (el) => el.child(svg(`${ICON}/sliders.svg`).size(11).flex_none().text_color(on ? t.accent : t.dim)))
+          .child(div().max_w(260).truncate().child(this.presetLabel(f)))
+          .when(on || asking, (el) => el.child(icon(`lf-e-${n}`, "✎", (cx) => this.startRename(n, cx))))
+          .when(on || asking, (el) => el.child(asking
+            ? icon(`lf-x-${n}`, tr.deleteAsk, (cx) => this.askDelete(n, cx), t.blocked)
+            : icon(`lf-x-${n}`, "×", (cx) => this.askDelete(n, cx))));
       }))
-      .when(Boolean(this.query.trim()) && active < 0, (el) => el.child(pill("lf-save").border_color(t.border).text_color(t.muted)
+      .when(this.canSave() && active < 0, (el) => el.child(pill("lf-save").border_color(t.border).text_color(t.muted)
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
         .on_click((_e, cx) => this.toggleSaveFilter(cx))
         .child(tr.saveFilter).child(div().text_size(10.5).text_color(t.dim).child("⌃S"))));
@@ -1924,6 +2062,7 @@ export default class Linear extends View {
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(ago(c.createdAt) + (c.editedAt ? tr.edited : "")))
         .child(this.miniButton(t, `${rkey}-react`, "☺ +", (cx) => { this.reactFor = this.reactFor === rkey ? null : rkey; cx.notify(); }, this.reactFor === rkey))
         .when(!reply, (el) => el.child(this.miniButton(t, `${rkey}-reply`, tr.reply, (cx) => this.openComposer(id, cx, { mode: "reply", parentId: c.id, who: name }))))
+        .child(this.miniButton(t, `${rkey}-copy`, tr.copyShort, (cx) => this.copy(c.body ?? "", tr.commentWord, cx)))
         .when(mine, (el) => el.child(this.miniButton(t, `${rkey}-edit`, tr.edit, (cx) => this.openComposer(id, cx, { mode: "edit", commentId: c.id, body: c.body ?? "" })))))
       .child(this.markdown(t, rkey, c.body ?? "", maxW))
       .when(Boolean(bar), (el) => el.child(bar));
@@ -2090,6 +2229,7 @@ export default class Linear extends View {
         .child(this.button(t, "d-open", tr.browser, (cx) => this.openUrl(issue.url, cx)))
         .child(this.button(t, "d-url", tr.copyUrl, (cx) => this.copy(issue.url, "URL", cx)))
         .child(this.button(t, "d-id", tr.copyId, (cx) => this.copy(issue.identifier, "ID", cx)))
+        .when(Boolean(issue.description?.trim()), (el) => el.child(this.button(t, "d-body-copy", tr.copyBody, (cx) => this.copy(issue.description, tr.bodyWord, cx))))
         .when(Boolean(pr), (el) => el.child(this.prBadge(t, pr, "d-pr", true))))
       .when(groups.length > 0, (el) => el.child(v_flex().gap(10).p(10).rounded(8).bg(t.surface).border_1().border_color(t.border).children(groups)));
 
@@ -2158,7 +2298,7 @@ export default class Linear extends View {
           .on_size_change((size, cx) => { if (this.measured(S.h, i.key, size.height)) cx.notify(); })
           .child(i.el()))))
       .when(Boolean(thumb), (el) => el.child(thumb));
-    return v_flex().flex_1().w_full().min_h(0).on_mouse_down("left", stop)
+    return v_flex().flex_1().w_full().min_h(0).on_mouse_down("left", (_e, cx) => { this.hold(cx); cx.stop_propagation(); })
       .child(h_flex().flex_1().w_full().min_h(0).items_start()
         .child(page)
         .when(showToc, (el) => el.child(this.outlineView(t, id, secs, thr, S, seen, tocW))))
