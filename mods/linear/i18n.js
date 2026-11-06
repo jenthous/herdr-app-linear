@@ -232,10 +232,15 @@ const ko = {
 
 const LANGS = { en, ko };
 let current = en;
+let currentTag = "en";
 
 export function setLanguage(tag) {
   const base = String(tag ?? "en").toLowerCase().split(/[-_]/)[0];
   current = LANGS[base] ?? en;
+  currentTag = LANGS[base] ? base : "en";
 }
+
+/** The language in use ("en" | "ko"). */
+export const currentLang = () => currentTag;
 
 export const T = () => current;

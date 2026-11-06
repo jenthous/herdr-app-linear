@@ -12,7 +12,8 @@ import * as api from "./api.js";
 import * as Q from "./query.js";
 import { Images, splitMarkdown, splitImages, imageParts, imageUrls } from "./media.js";
 import { Store } from "./store.js";
-import { T, setLanguage } from "./i18n.js";
+import { T, setLanguage, currentLang } from "./i18n.js";
+import { makeUpdater } from "./update.js";
 import { demo } from "./demo.js";
 import { Places } from "./places.js";
 import { stateIcon } from "./states.js";
@@ -70,8 +71,19 @@ const save = (k, v) => { if (!DEMO) STORE.set(k, v); };
 const slim = (i) => (i?.description?.length > 3000 ? { ...i, description: i.description.slice(0, 3000) } : i);
 const stop = (_e, cx) => cx.stop_propagation();
 
+// Release check: the header shows "Update Linear" when a newer release is out.
+const UPDATER = makeUpdater({
+  repo: "jenthous/herdr-app-linear",
+  version: "0.2.0",
+  key: "linear.update",
+  mod: "linear",
+  name: "Linear",
+  prompt: "Update the linear mod from github.com/jenthous/herdr-app-linear",
+});
+
 export default class Linear extends View {
   init(_props, cx) {
+    if (props()?.role === "update") { this.update = new UPDATER.Update(); return this.update.init(cx); }
     this.config = { agent: ["claude"], agentName: null, refreshSeconds: 60, autoState: true, taskContext: true, cacheDays: 30 };
     this.states = {}; // team id → workflow states
     this.key = null;
@@ -198,6 +210,9 @@ export default class Linear extends View {
       await this.places.scanAll();
     });
     cx.timer.every(2000, () => { STORE.flush(); });
+    // A newer release? At most one GitHub request a day, shared across copies.
+    UPDATER.check();
+    cx.timer.every(15 * 60 * 1000, () => UPDATER.check());
     cx.timer.every(Math.max(10, this.config.refreshSeconds) * 1000, (cx) => { if (this.key && !DEMO) this.refresh(cx, false); });
     // Redraw once a second only while an issue tab has a working agent (the elapsed time).
     cx.timer.every(1000, (cx) => {
@@ -1443,6 +1458,7 @@ export default class Linear extends View {
   // ── Drawing ───────────────────────────────────────────
 
   render() {
+    if (this.update) return this.update.render();
     const t = theme();
     const root = v_flex().id("linear-root").size_full().min_h(0).bg(t.popover).text_size(13).text_color(t.foreground)
       .track_focus(this.handle)
@@ -1477,6 +1493,7 @@ export default class Linear extends View {
       .child(div().text_size(11.5).text_color(t.dim).child(this.viewer?.organization?.name ?? ""))
       .when(DEMO, (el) => el.child(div().text_size(11).px(6).rounded(4).border_1().border_color(t.border).text_color(t.dim).child(T().demo)))
       .child(div().flex_1())
+      .when(Boolean(UPDATER.available()), (el) => el.child(UPDATER.pill(t, currentLang())))
       .when(busy, (el) => el.child(svg(`${ICON}/spinner.svg`).size(13).text_color(t.dim).spin(900)))
       .when(this.width >= WIDE, (el) => el.child(this.layoutSwitch(t)))
       .child(this.iconButton(t, "l-refresh", "↻", (cx) => this.refresh(cx, false)))
