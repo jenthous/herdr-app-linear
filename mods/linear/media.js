@@ -77,6 +77,8 @@ function splitTables(md) {
   return out;
 }
 
+const NOT_IMAGE = /\.(mp4|mov|m4v|webm|avi|mkv|mp3|wav|m4a|pdf|zip|gz|csv|tsv|xlsx?|docx?|pptx?|txt|json|log|har)\s*$/i;
+
 function splitImages(md) {
   const hits = [];
   for (const m of md.matchAll(UPLOAD_LINK)) hits.push({ at: m.index, len: m[0].length, url: m[2], alt: m[1], link: true, src: m[0].trim() });
@@ -89,7 +91,9 @@ function splitImages(md) {
     if (h.at < pos) continue;
     const text = md.slice(pos, h.at);
     if (text.trim()) parts.push({ kind: "text", text });
-    parts.push(h.link ? { kind: "img", url: h.url, alt: h.alt, link: true, src: h.src } : { kind: "img", url: h.url, alt: h.alt });
+    // a file named as a video or document (Linear names uploads after the file): a link, not downloaded
+    if (NOT_IMAGE.test(h.alt ?? "")) parts.push({ kind: "text", text: `[${h.alt}](${h.url})` });
+    else parts.push(h.link ? { kind: "img", url: h.url, alt: h.alt, link: true, src: h.src } : { kind: "img", url: h.url, alt: h.alt });
     pos = h.at + h.len;
   }
   const rest = md.slice(pos);

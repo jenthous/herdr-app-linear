@@ -74,7 +74,7 @@ const stop = (_e, cx) => cx.stop_propagation();
 // Release check: the header shows "Update Linear" when a newer release is out.
 const UPDATER = makeUpdater({
   repo: "jenthous/herdr-app-linear",
-  version: "0.2.0",
+  version: "0.2.1",
   key: "linear.update",
   mod: "linear",
   name: "Linear",
@@ -445,8 +445,16 @@ export default class Linear extends View {
   async searchServer(cx, text) {
     const q = Q.parse(text);
     if (Q.isEmpty(q) || DEMO) { this.server = []; return; }
+    // An identifier (WE-150) is also asked for directly: quicker than the filter search, and it
+    // finds archived issues, which the filter leaves out. It shows as soon as it arrives.
+    let hit = null;
+    const one = q.identifier ? api.issueByIdentifier(this.key, q.identifier.join("-")).then((i) => {
+      hit = i;
+      if (i && this.query === text) { this.server = [i, ...(this.serverFor === text ? this.server.filter((x) => x.id !== i.id) : [])]; this.serverFor = text; this.remember([i]); this.redraw(cx); this.prefetchImages(cx, { issue: i, comments: [] }); this.loadDetail(cx, i.identifier); }
+    }).catch(() => {}) : null; // (its detail and images start loading at once: it's the one you'll open)
     const r = await this.call(cx, "search", () => api.filterIssues(this.key, Q.serverFilter(q, this.teamIds())));
-    if (r && this.query === text) { this.server = r; this.serverFor = text; this.remember(r); }
+    await one;
+    if (r && this.query === text) { this.server = hit ? [hit, ...r.filter((x) => x.id !== hit.id)] : r; this.serverFor = text; this.remember(r); }
   }
 
   async searchDeep(cx) {
@@ -638,7 +646,9 @@ export default class Linear extends View {
     // A cached issue shows only when it matches; a server result (bonus 0) shows anyway, since the
     // server saw the whole description and the current state.
     const consider = (i, bonus = -1) => {
-      if (!i?.identifier || i.archivedAt || i.trashed) return;
+      if (!i?.identifier || i.trashed) return;
+      // archived ones only when asked for by their identifier (WE-150)
+      if (i.archivedAt && !(q.identifier && i.team?.key?.toUpperCase() === q.identifier[0] && i.number === q.identifier[1])) return;
       const s = Math.max(Q.localScore(i, q, this.viewer?.id), bonus);
       if (s < 0) return;
       const prev = seen.get(i.identifier);
@@ -833,8 +843,9 @@ export default class Linear extends View {
     cx.notify();
   }
 
+  // The selected issue's detail (and its images), read while it stays selected: shown beside the
+  // list in the split layout, and in the list layout already there when it's opened.
   schedulePreview(cx) {
-    if (this.width < WIDE || this.layout !== "split") return;
     const id = this.shownId();
     if (!id) return;
     const gen = ++this.previewGen;
@@ -2066,7 +2077,9 @@ export default class Linear extends View {
       .text_size(size * 0.52).font_semibold().text_color(t.muted).child([...(name || "?")][0].toUpperCase());
   }
 
-  commentView(t, id, c, maxW, reply) {
+  // `root` is the thread's first comment: Linear threads are one level deep, so a reply to a reply
+  // goes under the same root.
+  commentView(t, id, c, maxW, reply, root = c) {
     const tr = T();
     const name = c.user?.displayName ?? c.user?.name ?? tr.unknownUser;
     const mine = Boolean(this.viewer?.id) && c.user?.id === this.viewer.id;
@@ -2078,7 +2091,7 @@ export default class Linear extends View {
         .child(div().font_semibold().flex_none().child(name))
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(ago(c.createdAt) + (c.editedAt ? tr.edited : "")))
         .child(this.miniButton(t, `${rkey}-react`, "☺ +", (cx) => { this.reactFor = this.reactFor === rkey ? null : rkey; cx.notify(); }, this.reactFor === rkey))
-        .when(!reply, (el) => el.child(this.miniButton(t, `${rkey}-reply`, tr.reply, (cx) => this.openComposer(id, cx, { mode: "reply", parentId: c.id, who: name }))))
+        .child(this.miniButton(t, `${rkey}-reply`, tr.reply, (cx) => this.openComposer(id, cx, { mode: "reply", parentId: root.id, who: name })))
         .child(this.miniButton(t, `${rkey}-copy`, tr.copyShort, (cx) => this.copy(c.body ?? "", tr.commentWord, cx)))
         .when(mine, (el) => el.child(this.miniButton(t, `${rkey}-edit`, tr.edit, (cx) => this.openComposer(id, cx, { mode: "edit", commentId: c.id, body: c.body ?? "" })))))
       .child(this.markdown(t, rkey, c.body ?? "", maxW))
@@ -2091,7 +2104,7 @@ export default class Linear extends View {
     return v_flex().gap(12).p(12).rounded(8).bg(t.surface).border_1().border_color(target ? t.accent : t.border).min_w(0)
       .child(this.commentView(t, id, th.comment, maxW - 26, false))
       .when(th.replies.length > 0, (el) => el.child(v_flex().gap(12).ml(9).pl(14).border_l(2).border_color(t.border)
-        .children(th.replies.map((r) => this.commentView(t, id, r, maxW - 26 - 25, true)))));
+        .children(th.replies.map((r) => this.commentView(t, id, r, maxW - 26 - 25, true, th.comment)))));
   }
 
   labelsRow(t, id, issue) {

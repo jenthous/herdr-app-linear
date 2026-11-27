@@ -100,6 +100,15 @@ export function teamIssues(key, teamIds, after) {
   return issuesPage(key, teamIds.length ? { team: { id: { in: teamIds } } } : {}, after);
 }
 
+// One issue by its identifier (WE-150), archived ones too (list filters leave those out).
+// null when there's none.
+export async function issueByIdentifier(key, ident) {
+  try {
+    const d = await gql(key, `query One($id: String!) { issue(id: $id) { ...IssueFields } } ${FRAGMENT}`, { id: ident });
+    return d.issue ?? null;
+  } catch (e) { if (e.kind === "notfound" || e.kind === "graphql") return null; throw e; }
+}
+
 export async function filterIssues(key, filter) {
   return (await issuesPage(key, filter)).nodes;
 }
